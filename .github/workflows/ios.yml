@@ -20,7 +20,7 @@ on:
 jobs:
   core-tests:
     name: Core tests (portable)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +40,7 @@ jobs:
 
   build-ios:
     name: Build iOS app
-    runs-on: macos-14
+    runs-on: macos-15
     needs: core-tests
     steps:
       - uses: actions/checkout@v4
