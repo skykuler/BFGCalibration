@@ -1,0 +1,6 @@
+{
+  "name": "bfg-calibration-ui-checks",
+  "private": true,
+  "scripts": {"test": "node Tools/ui-regression.cjs"},
+  "devDependencies": {"jsdom": "31.0.1"}
+}
