@@ -43,7 +43,10 @@ public final class KeychainCredentialStore: CredentialStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: key
         ]
-        _ = SecItemDelete(query as CFDictionary)
+        let update = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
 
         var attributes = query
         attributes[kSecValueData as String] = data
@@ -71,6 +74,25 @@ public final class KeychainCredentialStore: CredentialStore {
         return [UInt8](data)
     }
 
+    /// Enumerates account metadata only, never exports the password data.
+    public func serials() -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let records = result as? [[String: Any]] else { return [] }
+        let prefix = account + "."
+        return records.compactMap { attributes in
+            guard let name = attributes[kSecAttrAccount as String] as? String,
+                  name.hasPrefix(prefix) else { return nil }
+            return PairedVehicleStore.normalizedSerial(String(name.dropFirst(prefix.count)))
+        }.sorted()
+    }
+
     public func delete(serial: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -80,12 +102,14 @@ public final class KeychainCredentialStore: CredentialStore {
         _ = SecItemDelete(query as CFDictionary)
     }
 
-    public func deleteAll() {
+    @discardableResult
+    public func deleteAll() -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service
         ]
-        _ = SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     private func compositeKey(_ serial: String) -> String {

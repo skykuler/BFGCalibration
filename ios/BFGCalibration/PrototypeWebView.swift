@@ -103,6 +103,33 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     }
 
     private let backupStore = BackupStore()
+    private let vehicleStore = PairedVehicleStore()
+    private let ioQueue = DispatchQueue(label: "com.bfgtools.calibration.files", qos: .utility)
+    private var clientGeneration: UInt64 = 0
+    private var clientListener: SessionListener?
+    private var restoredVehicles = false
+
+    /// A completed/cancelled client cannot deliver state into its successor.
+    private final class SessionListener: BfgBleClient.Listener {
+        weak var owner: PrototypeCoordinator?
+        let generation: UInt64
+        init(owner: PrototypeCoordinator, generation: UInt64) {
+            self.owner = owner
+            self.generation = generation
+        }
+        private func deliver(_ body: @escaping (PrototypeCoordinator) -> Void) {
+            guard let owner else { return }
+            let token = generation
+            owner.onMain { [weak owner] in
+                guard let owner, owner.clientGeneration == token else { return }
+                body(owner)
+            }
+        }
+        func bleClient(didUpdateStatus status: String) { deliver { $0.handleStatus(status) } }
+        func bleClient(didLog line: String) { deliver { $0.handleLog(line) } }
+        func bleClient(didFinish result: BfgBleClient.Result) { deliver { $0.handleFinish(result) } }
+        func bleClient(didFailWith message: String) { deliver { $0.handleFailure(message) } }
+    }
 
     private weak var webView: WKWebView?
     private var client: BfgBleClient?
@@ -125,21 +152,6 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// Result of the last completed read, which every write is derived from.
     private var lastRead: BfgBleClient.Result?
     private var pendingWrite: PendingWrite?
-    /// Set only after the rider explicitly accepts the read-only-serial default
-    /// for this session; see WriteAccessPolicy.allowsReadOnlySerials. It lives on
-    /// the coordinator, never on PendingWrite: a private stored property there
-    /// would demote the struct's memberwise initialiser to private and break
-    /// every construction site.
-    private var allowReadOnlySerialWrite = false
-    /// The action parked on the read-only-serial confirmation, run once it is
-    /// given. A closure rather than a replayed value, because two different flows
-    /// — a parameter write and a restore — can be the thing being confirmed.
-    private var pendingSerialWaivedAction: (() -> Void)?
-    /// Set for one write flow after the owner approves writing a profile byte the
-    /// static table does not agree with. See the pre-write table check.
-    private var offTableApproved = false
-    /// The pre-write snapshot parked on that approval, replayed once it is given.
-    private var pendingOffTableDump: RegisterDump?
     /// Throttle for the on-disk copy of the diagnostic trail.
     private var lastPersist = Date.distantPast
     /// A dashboard write parked on the unvalidated-encoding warning.
@@ -169,6 +181,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     private var dumpPurpose: DumpPurpose?
     /// The snapshot taken immediately before a write, which the write is
     /// measured against afterwards.
+    private var pendingCapacityAfterWrite = false
     private var preWriteDump: RegisterDump?
     private var lastAdaptationDump: RegisterDump?
     /// Where the last snapshot was written, so it can be handed to the share
@@ -185,6 +198,8 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     private var state: [String: Any] = [
         "appVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
         "connected": false,
+        "vehicleSn": "",
+        "credentialAvailable": false,
         "vehicles": [],
         "readOnlyVehicle": false,
         "firstBackupValid": false,
@@ -262,11 +277,16 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
     private func handle(action: String, value: String) {
         switch action {
-        case "pair-scan", "refresh-vehicles":
+        case "pair-scan":
             startDiscovery()
 
+        case "refresh-vehicles":
+            restoreSavedVehicles()
+            state["screen"] = "vehicles"
+            pushState()
+
         case "begin-pair":
-            pair()
+            pair(index: value)
 
         case "begin-connect", "refresh-read":
             refreshRead()
@@ -277,10 +297,8 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
         case "start-repair":
             pair()
 
-        case "pair-select":
-            // The page mirrors the tapped serial into `vehicleSn`, so the index
-            // itself carries no information the native side needs.
-            break
+        case "pair-select", "select-vehicle":
+            _ = selectVehicle(index: value)
 
         case "scan-dis", "scan-bfg":
             scan(module: action == "scan-dis" ? RegisterReadPlan.dashboard
@@ -295,42 +313,6 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
         case "confirm-unverified-dis":
             confirmUnverifiedDashboardWrite()
 
-        case "confirm-nserial-write":
-            confirmReadOnlySerialWrite()
-
-        case "confirm-offtable-write":
-            confirmOffTableWrite()
-
-        case "expert-mode":
-            requestExpertModeToggle()
-
-        case "dashboard-scan":
-            requestDashboardScan()
-
-        case "dashboard-probe":
-            requestDashboardProbe()
-
-        case "sweep-enable":
-            requestSweepEnable()
-
-        case "sweep-values":
-            requestSweepRun()
-
-        case "probe-enable":
-            requestProbeEnable()
-
-        case "probe-registers":
-            requestProbeRun()
-
-        case "capacity-enable":
-            requestCapacityEnable()
-
-        case "capacity-write":
-            requestCapacityWrite()
-
-        case "capacity-restore":
-            requestCapacityRestore()
-
         case "restore-first":
             requestRestore(first: true)
 
@@ -344,41 +326,10 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             confirmGate(value: value)
 
         case "write-gate-cancel":
-            pendingWrite = nil
-            gate = nil
+            cancelOperation(destination: "review")
 
         case "cancel":
-            // Captured before the teardown: whether this cancel aborted a write
-            // flow decides where the rider has to land.
-            let wroteAnything = activeOperation == .writeProfile
-                || activeOperation == .writeDisVoltage
-            let abortedWriteFlow = pendingWrite != nil
-                || dumpPurpose == .preWrite
-                || wroteAnything
-            client?.cancel()
-            client = nil
-            dumpPurpose = nil
-            pendingWrite = nil
-            pendingUnverified = nil
-            gate = nil
-            state["busyMessage"] = NSNull()
-            // Cancelling used to leave the page on the write-progress screen with
-            // nothing on it. The back arrow sends a cancel and then deliberately
-            // does not navigate, the client's own cancel never calls the listener
-            // back, and that screen's caption falls back to a waiting line — so
-            // the rider could not reach settings, could not export the log and
-            // could not get home. A cancel has to end somewhere final and say so.
-            if abortedWriteFlow {
-                // Accurate in both directions: before the write frame goes out we
-                // can promise nothing was written; once it may have gone out we
-                // must not.
-                state["errorMessage"] = wroteAnything
-                    ? "已取消。写入指令可能已经发出，请重新读取车辆参数确认当前配置后再决定下一步。"
-                    : "已取消；本次没有发送任何写入指令，车辆参数未改变。"
-                state["screen"] = "review"
-                state["modal"] = "operation-failed"
-            }
-            pushState()
+            cancelOperation(destination: value)
 
         case "show-license":
             state["modal"] = "license"
@@ -409,7 +360,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
         case "open-website":
             openWebsite()
 
-        case "screen", "modal-state", "select-vehicle":
+        case "screen", "modal-state":
             // Purely presentational, and the page already handled it locally.
             // `screen`/`modal-state` are the page reporting its own navigation
             // back; nothing needs to be kept in sync, because `pushState()`
@@ -441,6 +392,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     // MARK: - Vehicle discovery
 
     private func startDiscovery() {
+        clearDeferredRead()
         state["vehicles"] = []
         state["pairScanning"] = true
         pushState()
@@ -484,10 +436,16 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
     private var serial: String { state["vehicleSn"] as? String ?? "" }
 
-    private func pair() {
+    private func pair(index: String = "") {
+        clearDeferredRead()
+        if !index.isEmpty, !selectVehicle(index: index) { return }
+        guard PairedVehicleStore.normalizedSerial(serial) != nil else {
+            state["errorMessage"] = "请先扫描并明确选择需要配对的车辆。"
+            state["modal"] = "missing-vehicle"
+            pushState()
+            return
+        }
         goTo("pair-progress")
-        // An empty serial lets the client take the first vehicle that advertises
-        // a valid name; a set one pins the scan to the row the user tapped.
         startClient(record: placeholderRecord(serial: serial), operation: .pairAndRead)
     }
 
@@ -500,12 +458,14 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// sweep does, for a single module: real values, real stability, a JSON in
     /// Documents and a share button on the completing dialog.
     private func scan(module: Int) {
+        clearDeferredRead()
         dumpPurpose = .adaptation
         startClient(record: placeholderRecord(serial: serial),
                     operation: .dumpRegisters, dumpModules: [module])
     }
 
     private func refreshRead() {
+        clearDeferredRead()
         startClient(record: placeholderRecord(serial: serial), operation: .readOnly)
     }
 
@@ -513,6 +473,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// then re-reads the vehicle, because a write may not proceed without a
     /// fresh pre-write snapshot.
     private func requestWrite(value: String) {
+        clearDeferredRead()
         guard let lastRead else {
             writeFailure("车辆数据尚未读取完成，请重新连接后再试。")
             return
@@ -522,16 +483,8 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
         // the owner is the one who can tell the difference — so ask once, state
         // the consequence, and keep every other rail in place.
         // One approval covers one write flow, never the session.
-        offTableApproved = false
-        pendingOffTableDump = nil
-        if WriteAccessPolicy.isReadOnlySerial(serial), !allowReadOnlySerialWrite {
-            pendingSerialWaivedAction = { [weak self] in self?.requestWrite(value: value) }
-            state["errorMessage"] = "该车辆序列号以 N 开头。原版工具把这类序列号一律视为只读，"
-                + "因为它从未验证过这些车型——这台车就是其一。"
-                + "继续只会写入计量模块的电压与容量，写前仍会整片快照、仍需通过风险门、"
-                + "写后仍会全量比对，随时可以回滚到写入前的值。"
-            state["modal"] = "nserial-write"
-            pushState()
+        if WriteAccessPolicy.isReadOnlySerial(serial) {
+            writeFailure("该序列号以 N 开头，仅允许读取，不发送写入指令。")
             return
         }
 
@@ -597,7 +550,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             }
             // Same release as the BLE layer, stated here too so the rider gets a
             // coherent answer instead of a client-level failure further down.
-            guard lastRead.writeSupported || WriteAccessPolicy.allowsUnverifiedCombination() else {
+            guard lastRead.writeSupported else {
                 writeFailure("当前仪表与计量模块组合尚未通过写入验证；"
                     + "本次没有发送写入。请先导出诊断数据用于适配。")
                 return
@@ -608,8 +561,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             // and the rollback path below still have to succeed on their own, and
             // because the rider is shown what could not be read before the frame
             // goes out.
-            guard backupStore.firstBackup(serial: serial).valid
-                    || WriteAccessPolicy.allowsPartialBackup() else {
+            guard backupStore.firstBackup(serial: serial).valid else {
                 writeFailure("首次原参数备份尚未建立，本次没有发送写入指令。"
                     + "请先返回连接车辆读取一次，再回来写入。")
                 return
@@ -631,29 +583,10 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// flag carries it past the table check and on to the risk gate — the write
     /// itself is unchanged, still one profile byte, still snapshotted first and
     /// still compared afterwards.
-    private func confirmOffTableWrite() {
-        guard let dump = pendingOffTableDump else { return }
-        pendingOffTableDump = nil
-        offTableApproved = true
-        state["modal"] = NSNull()
-        pushState()
-        handleDump(dump, purpose: .preWrite)
-    }
+
 
     /// The owner's answer to the read-only-serial default.
-    private func confirmReadOnlySerialWrite() {
-        guard let action = pendingSerialWaivedAction else { return }
-        pendingSerialWaivedAction = nil
-        allowReadOnlySerialWrite = true
-        WriteAccessPolicy.allowsReadOnlySerials = true
-        // The page gates the write button on these two, so they have to follow
-        // the decision or the rider confirms and then finds the button disabled.
-        state["readOnlyVehicle"] = false
-        if let read = lastRead { state["writeSupported"] = read.writeSupported }
-        state["modal"] = NSNull()
-        pushState()
-        action()
-    }
+
 
     /// The page's "still try" answer to the unvalidated-encoding warning.
     private func confirmUnverifiedDashboardWrite() {
@@ -678,6 +611,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// The original re-reads and then puts the confirmation back in front of the
     /// user, rather than writing again on the strength of the earlier choice.
     private func requestRetryWrite(value: String) {
+        clearDeferredRead()
         pendingRetryRequest = value
         goTo("connect-progress")
         startClient(record: placeholderRecord(serial: serial), operation: .compareRead)
@@ -691,42 +625,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// write policy, so the wording must be unmissable and the cancel path must
     /// be the obvious default. Session-scoped — relaunching clears it, so the
     /// next rider of this phone never inherits a released limit.
-    private func requestExpertModeToggle() {
-        let turningOn = !WriteAccessPolicy.expertMode
-        let alert = UIAlertController(
-            title: turningOn ? "开启专家模式" : "关闭专家模式",
-            message: turningOn
-                ? "将放开这些限制：\n"
-                    + "· N 开头与 3U 开头等未验证序列号\n"
-                    + "· 未通过通信验证的仪表与计量组合\n"
-                    + "· 不在内置表内的容量\n\n"
-                    + "不会放开的：写前整片快照、快照落盘校验、"
-                    + "单字节写（模块 0x10 地址 0x00）、写后回读与全量比对、两条恢复路径。\n\n"
-                    + "仪表盘写入存在已知损坏案例，可能损坏计量模块、导致车辆无法启动；"
-                    + "备份不保证一定可以恢复。请自行承担风险。"
-                : "关闭后，未验证车型将恢复为仅可读取。",
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in
-            self.pushState()
-        })
-        alert.addAction(UIAlertAction(title: turningOn ? "我已知晓，开启" : "确认关闭",
-                                      style: .destructive) { _ in
-            WriteAccessPolicy.expertMode = turningOn
-            self.state["expertMode"] = turningOn
-            // The remaining gate this session: every write still has to pass
-            // the snapshot and read-back rails, which are untouched.
-            self.pushState()
-        })
-        // This type is a coordinator, not a view controller, so the alert has to
-        // be handed to whatever is actually on screen — same route share() uses.
-        guard let scene = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene }).first,
-              var presenter = (scene.windows.first(where: { $0.isKeyWindow })
-                                ?? scene.windows.first)?.rootViewController
-        else { return }
-        while let presented = presenter.presentedViewController { presenter = presented }
-        presenter.present(alert, animated: true)
-    }
+
 
     // MARK: - Rated-capacity register (0x0E)
 
@@ -737,34 +636,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// of its own. If it does, that register is the real upstream switch, and the
     /// one a capacity write would eventually have to reach; the meter is only a
     /// copy that gets overwritten.
-    private func requestDashboardScan() {
-        let text = "将只读扫描仪表盘模块 0x01 的全部 256 个寄存器（0x00–0xFF），一遍。\n\n"
-            + "不发送任何写入指令，不需要开启任何开关。\n\n"
-            + "扫描约需 1–2 分钟，请保持车辆开机、手机贴近。\n\n"
-            + "日志会逐条记录每个有响应的地址，并在结束时汇总："
-            + "哪些地址的值正好等于计量模块的额定容量——那就是仪表自己存着这份配置的位置。"
-        let alert = UIAlertController(
-            title: "扫描仪表盘全部寄存器（只读）",
-            message: text,
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "开始扫描", style: .default) { [weak self] _ in
-            guard let self else { return }
-            self.goTo("scan-progress")
-            self.state["scanModule"] = "仪表盘 0x01 全片"
-            self.state["scanReplies"] = 0
-            self.state["scanTimeouts"] = 0
-            self.pushState()
-            // The core compares numbers; it does not read the backup store.
-            let reference = self.backupStore.prewriteRatedCapacity(serial: self.serial) > 0
-                ? self.backupStore.prewriteRatedCapacity(serial: self.serial)
-                : self.backupStore.ratedCapacityBackup(serial: self.serial)
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .dashboardScan,
-                             referenceCapacity: reference)
-        })
-        presentAlert(alert)
-    }
+
 
     // MARK: - Dashboard read-only probe
 
@@ -776,85 +648,13 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// meter, which is why a meter write is reverted a few seconds later — and
     /// although every connection already read it, the success path logged nothing.
     /// So no export ever contained the one value that explains the reverts.
-    private func requestDashboardProbe() {
-        let list = NinebotFrame.dashboardProbePlan
-            .map { String(format: "0x%02X %@", $0.index, $0.label) }
-            .joined(separator: "\n")
-        let text = "将只读以下仪表盘寄存器，不发送任何写入：\n\n" + list
-            + "\n\n每个寄存器的原始帧和解析结果都会写进日志（DISPROBE_ 行）。"
-            + "其中 0x92 是仪表自己的电压配置——它才是那台车会反复覆盖计量模块的原因。"
-        let alert = UIAlertController(
-            title: "仪表盘只读诊断",
-            message: text,
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "开始读取", style: .default) { [weak self] _ in
-            guard let self else { return }
-            self.goTo("write-progress")
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .dashboardProbe)
-        })
-        presentAlert(alert)
-    }
+
 
     // MARK: - Capacity sweep
 
     /// The fifth switch. This is the only mode where the tool writes a value it
     /// did not read — so it is gated more tightly than the other four, and the
     /// run reverts every candidate before touching the next one.
-    private func requestSweepEnable() {
-        let turningOn = !WriteAccessPolicy.allowsCapacitySweep
-        let onText = "将允许工具按固件表里的容量值逐个试探，从小到大，并逐个写回原值。\n\n"
-            + "这是唯一一种工具会写入「它没读到的值」的模式：试探期间 0x0E 会短暂变成候选值，"
-            + "然后立刻恢复。每一步都先读基准、再写试探值、再回读判定、再写回原值、再回读确认。\n\n"
-            + "任何一步恢复不成功，试探会立即中止而不是继续往前走。\n\n"
-            + "能得到的结论：这个模块接受的容量上界在哪。如果连 36000 都拒绝，"
-            + "说明模块有一个硬上限，靠改寄存器校到 50Ah 不可能。\n\n"
-            + "本开关仅本次运行有效，不被其他四个开关连带开启。"
-        let offText = "关闭后，试探按钮会被拒绝。已保存的备份不受影响。"
-        let alert = UIAlertController(
-            title: turningOn ? "开启容量值试探" : "关闭容量值试探",
-            message: turningOn ? onText : offText,
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: turningOn ? "我已知晓，开启" : "确认关闭",
-                                      style: .destructive) { [weak self] _ in
-            WriteAccessPolicy.allowsCapacitySweep = turningOn
-            self?.state["sweepEnabled"] = turningOn
-            self?.pushState()
-        })
-        presentAlert(alert)
-    }
-
-    private func requestSweepRun() {
-        guard WriteAccessPolicy.allowsCapacitySweep else {
-            state["errorMessage"] = "容量值试探未开启，请先在设置页开启。"
-            state["modal"] = "operation-failed"
-            pushState()
-            return
-        }
-        let current = backupStore.prewriteRatedCapacity(serial: serial) > 0
-            ? backupStore.prewriteRatedCapacity(serial: serial)
-            : backupStore.ratedCapacityBackup(serial: serial)
-        let known = current > 0 ? "\(current) mAh" : "未知（会在试探开始时读取）"
-        let onText = "工具会读取 0x0E 当前值作为基准，然后按固件表里的容量从小到大逐个试探："
-            + "写入候选值 → 回读判定 → 立刻写回基准 → 回读确认，再试下一个。\n\n"
-            + "基准：" + known + "\n\n"
-            + "试探结束后 0x0E 会回到基准值。如果某一步无法恢复，试探会立即中止并告诉你。\n\n"
-            + "日志里会出现 SWEEP_ 开头的行，记录每个候选值被接受还是拒绝。"
-        let alert = UIAlertController(
-            title: "容量值试探",
-            message: onText,
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "开始试探", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            self.goTo("write-progress")
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .sweepCapacityValues)
-        })
-        presentAlert(alert)
-    }
 
     // MARK: - Register-write probe
 
@@ -867,60 +667,6 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// route is closed, it is worth asking whether ANY of the capacity candidates
     /// accept a write. Every probe writes a register its own current value back,
     /// so the vehicle ends where it started; what is measured is the ACK.
-    private func requestProbeEnable() {
-        let turningOn = !WriteAccessPolicy.allowsRegisterProbe
-        // Broken into named pieces on purpose: as one nested ternary the type
-        // checker gave up ("unable to type-check this expression in reasonable
-        // time"), which is a compile failure, not a warning.
-        let list = WriteAccessPolicy.probeRegisterAllowlist
-            .map { String(format: "0x%02X", $0) }.joined(separator: "  ")
-        let onText = "将允许工具向这五个寄存器各写一次：\n" + list
-            + "\n\n关键是：每个寄存器写回去的都是它自己的当前值，"
-            + "所以探测成功也不会改变车辆的任何参数。\n\n"
-            + "能得到的结论只有一条——这些寄存器里哪些接受写入。"
-            + "0x0E 已经试过，它以完全沉默回应，所以需要先知道剩下的有没有机会。\n\n"
-            + "地址白名单在协议层写死，调用方传别的地址会被直接拒绝。\n\n"
-            + "本开关仅本次运行有效，且不被专家模式或容量开关连带开启。"
-        let offText = "关闭后，探测按钮会被拒绝。已保存的备份不受影响。"
-        let alert = UIAlertController(
-            title: turningOn ? "开启寄存器写入探测" : "关闭寄存器写入探测",
-            message: turningOn ? onText : offText,
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: turningOn ? "我已知晓，开启" : "确认关闭",
-                                      style: .destructive) { [weak self] _ in
-            WriteAccessPolicy.allowsRegisterProbe = turningOn
-            self?.state["probeEnabled"] = turningOn
-            self?.pushState()
-        })
-        presentAlert(alert)
-    }
-
-    private func requestProbeRun() {
-        guard WriteAccessPolicy.allowsRegisterProbe else {
-            state["errorMessage"] = "寄存器写入探测未开启，请先在设置页开启。"
-            state["modal"] = "operation-failed"
-            pushState()
-            return
-        }
-        let names = WriteAccessPolicy.probeRegisterAllowlist
-            .map { String(format: "0x%02X", $0) }.joined(separator: "  ")
-        let alert = UIAlertController(
-            title: "探测容量候选寄存器",
-            message: "将依次向 \(names) 各写一次，每次写的都是它当前的读数值。"
-                + "\n\n车辆参数不会因为这个探测而改变；探测只是问它们接不接受写入。\n\n"
-                + "每个地址会走完整流程：先读当前值 → 写回同一个值 → 等 ACK → 回读确认。"
-                + "\n\n结果写在日志的 PROBE_ 行里。",
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "开始探测", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            self.goTo("write-progress")
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .probeRegisterWrites)
-        })
-        presentAlert(alert)
-    }
 
     /// The third switch, and the one with the largest physical reach.
     ///
@@ -932,30 +678,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     ///
     /// Session-scoped like the others: nothing persists it, so the next rider of
     /// this phone does not inherit a second write site.
-    private func requestCapacityEnable() {
-        let turningOn = !WriteAccessPolicy.allowsCapacityWrite
-        let alert = UIAlertController(
-            title: turningOn ? "开启容量寄存器写入" : "关闭容量寄存器写入",
-            message: turningOn
-                ? "将允许工具写第二个寄存器：计量模块的额定容量 0x0E。\n\n"
-                    + "为什么需要它：实测确认只写档位会在约 6.5 秒后被车辆改回，"
-                    + "因为它与 0x0E 的值不自洽。要让改动站住，两者必须一起改。\n\n"
-                    + "风险比档位写入更大：0x0E 直接参与电量计算，写错会让电量显示异常，"
-                    + "而且车辆的自洽性检查不会帮你改回来（它只恢复档位）。\n\n"
-                    + "仍然保留的护栏：写入前必须先读到原值做备份，读不到就不发任何指令；"
-                    + "写后保持连接观察 90 秒；日志记录 0x0E / 0x0F / 档位三个寄存器。\n\n"
-                    + "允许范围 5000–100000 mAh。本开关仅本次运行有效。"
-                : "关闭后，容量寄存器的写入与恢复都会被拒绝。已保存的备份不受影响。",
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: turningOn ? "我已知晓，开启" : "确认关闭",
-                                      style: .destructive) { [weak self] _ in
-            WriteAccessPolicy.allowsCapacityWrite = turningOn
-            self?.state["capacityWriteEnabled"] = turningOn
-            self?.pushState()
-        })
-        presentAlert(alert)
-    }
+
 
     /// The only rider-facing path that writes the second register.
     ///
@@ -964,47 +687,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// its own confirmation here. The three are independent on purpose — a rider
     /// who released "unvalidated model" has not thereby agreed to let the tool
     /// rewrite the number the state-of-charge is computed from.
-    private func requestCapacityWrite() {
-        guard WriteAccessPolicy.allowsCapacityWrite else {
-            state["errorMessage"] = "容量寄存器写入未开启。它是独立开关，不与专家模式联动："
-                + "专家模式放开的是「没验证过的车型」，这里放开的是「多写一个寄存器」，"
-                + "后者物理权限更大——0x0E 直接参与电量计算。请先在设置页开启。"
-            state["modal"] = "operation-failed"
-            pushState()
-            return
-        }
-        let known = backupStore.ratedCapacityBackup(serial: serial)
-        let alert = UIAlertController(
-            title: "写入额定容量寄存器 0x0E",
-            message: "这会改动计量模块用来算电量的额定容量。\n\n"
-                + "工具会先读原值做备份，读不到就一个字节都不发。"
-                + "写入后保持连接观察 90 秒，并在日志里记录 0x0E / 0x0F / 档位三个寄存器的变化。\n\n"
-                + (known > 0 ? "当前已备份的原值：\(known) mAh\n" : "尚未建立 0x0E 备份（本次写入会建立）\n")
-                + "允许范围 5000–100000 mAh。",
-            preferredStyle: .alert)
-        alert.addTextField { field in
-            field.placeholder = "目标容量，例如 55000"
-            field.keyboardType = .numberPad
-        }
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "确认写入", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            let text = alert.textFields?.first?.text ?? ""
-            guard let value = Int(text.trimmingCharacters(in: .whitespaces)),
-                  WriteAccessPolicy.isWritableCapacity(value) else {
-                self.state["errorMessage"] = "目标容量无效：需要在 5000–100000 mAh 之间，"
-                    + "并且已经开启容量寄存器写入。本次没有发送任何指令。"
-                self.state["modal"] = "operation-failed"
-                self.pushState()
-                return
-            }
-            self.goTo("write-progress")
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .writeCapacity,
-                             targetCapacity: value)
-        })
-        presentAlert(alert)
-    }
+
 
     /// Puts the backed-up 0x0E value back.
     ///
@@ -1012,52 +695,11 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// decoration. This is the counterpart that makes the backup real, and it
     /// goes through the same write path — same pre-read gate, same watch, same
     /// logging — so a rollback is as observable as the write it undoes.
-    private func requestCapacityRestore() {
-        guard WriteAccessPolicy.allowsCapacityWrite else {
-            state["errorMessage"] = "容量寄存器写入未开启，恢复同样被关闭。请先在设置页开启。"
-            state["modal"] = "operation-failed"
-            pushState()
-            return
-        }
-        let first = backupStore.ratedCapacityBackup(serial: serial)
-        let recent = backupStore.prewriteRatedCapacity(serial: serial)
-        let target = recent > 0 ? recent : first
-        guard target > 0 else {
-            state["errorMessage"] = "当前车辆没有 0x0E 备份，无法恢复。"
-                + "备份会在第一次成功读取到 0x0E 时建立。"
-            state["modal"] = "operation-failed"
-            pushState()
-            return
-        }
-        let alert = UIAlertController(
-            title: "恢复 0x0E 到备份值",
-            message: "目标值：\(target) mAh\n"
-                + "（首次备份 \(first > 0 ? String(first) : "无")，"
-                + "最近写入前 \(recent > 0 ? String(recent) : "无")）\n\n"
-                + "恢复同样是写入：会先读当前值做备份，写后观察 90 秒。",
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in self.pushState() })
-        alert.addAction(UIAlertAction(title: "确认恢复", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            self.goTo("write-progress")
-            self.startClient(record: self.placeholderRecord(serial: self.serial),
-                             operation: .writeCapacity,
-                             targetCapacity: target)
-        })
-        presentAlert(alert)
-    }
 
-    /// Single presentation route for alerts, matching the one the expert-mode
+
+    /// Shared read-back verification entry point.
     /// switch already uses.
-    private func presentAlert(_ alert: UIAlertController) {
-        guard let scene = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene }).first,
-              var presenter = (scene.windows.first(where: { $0.isKeyWindow })
-                                ?? scene.windows.first)?.rootViewController
-        else { return }
-        while let presented = presenter.presentedViewController { presenter = presented }
-        presenter.present(alert, animated: true)
-    }
+
 
     private func requestPostWriteReread() {
         guard let target = lastPostWriteTarget else {
@@ -1077,6 +719,7 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// the stored bytes belong to a different config family — writing them would
     /// change a value whose meaning it cannot confirm.
     private func requestDashboardRestore() {
+        clearDeferredRead()
         guard !WriteAccessPolicy.isReadOnlySerial(serial) else {
             state["errorMessage"] = "该序列号以 N 开头，仅允许读取，不发送任何写入指令。"
             state["modal"] = "restore-unavailable"
@@ -1166,83 +809,109 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             // The static table is an assumption about the firmware. If the
             // vehicle contradicts it, writing from the table would put the
             // wrong capacity on the vehicle — the failure that damages modules.
-            if !pending.isDashboard, !offTableApproved,
+            if !pending.isDashboard,
                case .disagrees(let expected, let reported) = dump.agreement() {
-                // Refusing outright is right for someone who simply wants their
-                // battery set, but it leaves no way to *establish* the real
-                // mapping — and for a model the author never saw, that mapping is
-                // the whole problem. So state the discrepancy in numbers, park the
-                // write, and let the owner decide. Nothing else is relaxed: the
-                // snapshot is already taken, the risk gate still runs, and the
-                // result is still compared afterwards and can be rolled back.
-                pendingOffTableDump = dump
-                state["errorMessage"] = "本车型的容量映射与静态表不同：表把档位 0x"
-                    + String(format: "%02X", pending.profile) + " 读作 \(expected)mAh，"
-                    + "你的车报的是 \(reported)mAh。照表写入得不到你选的容量，"
-                    + "车会按它自己的表来解释这个档位编号。"
-                    + "继续的话仍然只写一个档位字节：写前快照已保存，风险门与写后全量比对照常，随时可回滚。"
-                state["modal"] = "offtable-write"
-                pushState()
+                writeFailure("该车型回读容量与内置表不一致（表 \(expected) mAh，回读 \(reported) mAh），"
+                    + "本次没有发送写入指令。请导出诊断用于核对。")
                 return
             }
 
-            preWriteDump = dump
+            let token = clientGeneration
+            let directory = Self.documentsDirectory()
+            state["busyMessage"] = "正在保存并核实写入前寄存器快照…"
             pushState()
-            openGate()
+            ioQueue.async { [weak self] in
+                let saved = Result { try RegisterDumpStore(directory: directory).savePrewrite(dump) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.clientGeneration == token, self.pendingWrite != nil,
+                          self.serial == dump.serial else { return }
+                    switch saved {
+                    case .success(let url):
+                        self.lastDumpURL = url
+                        self.preWriteDump = dump
+                        self.state["busyMessage"] = NSNull()
+                        self.openGate()
+                    case .failure(let error):
+                        self.writeFailure("写前快照未能保存并核实，没有发送写入指令：" + error.localizedDescription)
+                    }
+                }
+            }
 
         case .adaptation:
             // Routed to `saveAdaptationDump` before reaching here.
             break
 
         case .postWrite:
-            guard let before = preWriteDump, let check = lastPostWriteTarget else { return }
-            let changes = dump.changes(from: before)
-            let expectedModule = check.isDashboard ? RegisterDump.dashboardModule
-                                                   : RegisterDump.meterModule
-            let expectedIndex = check.isDashboard ? 0x92 : 0x00
-            let collateral = changes.filter {
-                !($0.module == expectedModule && $0.index == expectedIndex)
-            }
-            if collateral.isEmpty {
-                // Only a clean comparison earns the "confirmed" record: the sweep
-                // exists to catch a write that reached further than intended, and
-                // a target that landed alongside collateral damage is not a
-                // successful write.
-                if let target = lastPostWriteTarget, target.profile >= 0 {
-                    backupStore.saveLastConfirmed(serial: dump.serial,
-                                                  profile: target.profile)
+            let token = clientGeneration
+            let url = Self.documentsDirectory().appendingPathComponent("bfg-postwrite-\(dump.serial).json")
+            ioQueue.async { [weak self] in
+                let saved = Result { try dump.json().write(to: url, options: .atomic) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.clientGeneration == token else { return }
+                    switch saved {
+                    case .success:
+                        self.lastDumpURL = url
+                        self.finishPostWriteDump(dump)
+                    case .failure(let error):
+                        self.state["screen"] = "review"
+                        self.state["errorMessage"] = "目标已回读，但写后快照保存失败，请重新核对：" + error.localizedDescription
+                        self.state["modal"] = "verification-incomplete"
+                        self.pushState()
+                    }
                 }
-                refreshBackupState(serial: dump.serial)
-                showWriteSuccess(capacityPending: false)
-                state["errorMessage"] = "写入后比对：除目标地址外无其他寄存器变化。"
-                pushState()
-            } else {
-                let list = collateral.prefix(8).map {
-                    String(format: "0x%02X/0x%02X %d→%d", $0.module, $0.index,
-                           $0.before, $0.after)
-                }.joined(separator: "；")
-                state["errorMessage"] = "⚠ 写入后检测到\(collateral.count)处目标之外的寄存器变化："
-                    + list + "。这说明本次写入波及了预期之外的地址，"
-                    + "请立即导出寄存器快照，并在查明原因前停止继续写入。"
-                // Deliberately not `write-success`: this is the earliest signal
-                // that the write reached further than intended, and it used to be
-                // presented under a success dialog.
-                state["screen"] = "review"
-                state["result"] = NSNull()
-                state["modal"] = "write-collateral"
-                pushState()
             }
+
+        }
+    }
+
+    private func finishPostWriteDump(_ dump: RegisterDump) {
+        guard let before = preWriteDump, let check = lastPostWriteTarget else { return }
+        let changes = dump.changes(from: before)
+        let expectedModule = check.isDashboard ? RegisterDump.dashboardModule
+                                               : RegisterDump.meterModule
+        let expectedIndex = check.isDashboard ? 0x92 : 0x00
+        let collateral = changes.filter {
+            !($0.module == expectedModule && $0.index == expectedIndex)
+        }
+        if collateral.isEmpty {
+            // Only a clean comparison earns the "confirmed" record: the sweep
+            // exists to catch a write that reached further than intended, and
+            // a target that landed alongside collateral damage is not a
+            // successful write.
+            if let target = lastPostWriteTarget, target.profile >= 0 {
+                backupStore.saveLastConfirmed(serial: dump.serial,
+                                              profile: target.profile)
+            }
+            refreshBackupState(serial: dump.serial)
+            showWriteSuccess(capacityPending: pendingCapacityAfterWrite)
+            state["errorMessage"] = "写入后比对：除目标地址外无其他寄存器变化。"
+                + (pendingCapacityAfterWrite ? "剩余容量仍待更新，请稍后重新读取。" : "")
+            pushState()
+        } else {
+            let list = collateral.prefix(8).map {
+                String(format: "0x%02X/0x%02X %d→%d", $0.module, $0.index,
+                       $0.before, $0.after)
+            }.joined(separator: "；")
+            state["errorMessage"] = "⚠ 写入后检测到\(collateral.count)处目标之外的寄存器变化："
+                + list + "。这说明本次写入波及了预期之外的地址，"
+                + "请立即导出寄存器快照，并在查明原因前停止继续写入。"
+            // Deliberately not `write-success`: this is the earliest signal
+            // that the write reached further than intended, and it used to be
+            // presented under a success dialog.
+            state["screen"] = "review"
+            state["result"] = NSNull()
+            state["modal"] = "write-collateral"
+            pushState()
         }
     }
 
     private func requestRestore(first: Bool) {
+        clearDeferredRead()
         let backup = first ? backupStore.firstBackup(serial: serial)
                            : backupStore.prewriteBackup(serial: serial)
         // A restore is its own write flow and must earn its own approval: without
         // this, an override given for a parameter write leaked into the restore
         // path, which would then skip the table check entirely.
-        offTableApproved = false
-        pendingOffTableDump = nil
 
         guard backup.valid else {
             // The settings screen has no error area, so a message written here is
@@ -1253,13 +922,8 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             pushState()
             return
         }
-        if WriteAccessPolicy.isReadOnlySerial(serial), !allowReadOnlySerialWrite {
-            pendingSerialWaivedAction = { [weak self] in self?.requestRestore(first: first) }
-            state["errorMessage"] = "该车辆序列号以 N 开头。原版工具把这类序列号一律视为只读。"
-                + "恢复会把备份里的档位写回计量模块，因此同样需要你确认一次；"
-                + "确认后本次会话的写入一并放开。"
-            state["modal"] = "nserial-write"
-            pushState()
+        if WriteAccessPolicy.isReadOnlySerial(serial) {
+            writeFailure("该序列号以 N 开头，仅允许读取，不发送恢复写入指令。")
             return
         }
         pendingWrite = PendingWrite(isDashboard: false,
@@ -1273,25 +937,116 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
     private func startClient(record: DeviceRecord, operation: BfgBleClient.Operation,
                              targetProfile: Int = -1,
-                             targetCapacity: Int = 0,
-                             referenceCapacity: Int = 0,
                              expectedDisConfigRaw: Int = -1,
                              allowUnverifiedDis: Bool = false,
                              dumpModules: [Int] = []) {
-        client?.cancel()
+        stopClient()
         activeOperation = operation
+        let listener = SessionListener(owner: self, generation: clientGeneration)
+        clientListener = listener
         let newClient = BfgBleClient(record: record, operation: operation,
-                                     targetProfile: targetProfile,
-                                     targetCapacity: targetCapacity,
-                                     referenceCapacity: referenceCapacity,
-                                     expectedDisConfigRaw: expectedDisConfigRaw,
-                                     allowUnverifiedDis: allowUnverifiedDis,
-                                     dumpModules: dumpModules,
-                                     transport: CoreBluetoothTransport(),
-                                     credentialStore: KeychainCredentialStore.shared,
-                                     listener: self)
+            targetProfile: targetProfile, expectedDisConfigRaw: expectedDisConfigRaw,
+            allowUnverifiedDis: allowUnverifiedDis, dumpModules: dumpModules,
+            transport: CoreBluetoothTransport(), credentialStore: KeychainCredentialStore.shared,
+            listener: listener)
         client = newClient
         newClient.start()
+    }
+
+    private func stopClient() {
+        clientGeneration &+= 1
+        client?.cancel()
+        client = nil
+        clientListener = nil
+    }
+
+    private func clearDeferredRead() {
+        postWriteTimer?.cancel()
+        postWriteTimer = nil
+        postWriteCheck = nil
+    }
+
+    private func cancelOperation(destination: String) {
+        let mightHaveWritten = client != nil && (activeOperation == .writeProfile || activeOperation == .writeDisVoltage)
+        stopClient()
+        stopScanCountdown()
+        postWriteTimer?.cancel()
+        postWriteTimer = nil
+        postWriteCheck = nil
+        pendingWrite = nil
+        pendingUnverified = nil
+        pendingRetryRequest = nil
+        dumpPurpose = nil
+        preWriteDump = nil
+        gate = nil
+        state["pairScanning"] = false
+        state["busyMessage"] = NSNull()
+        state["writeGate"] = NSNull()
+        state["modal"] = mightHaveWritten ? ("operation-failed" as Any) : NSNull()
+        state["result"] = NSNull()
+        state["errorMessage"] = mightHaveWritten
+            ? "已取消。写入指令可能已经发出，请重新读取车辆参数后再决定下一步。" : ""
+        state["screen"] = ["home", "review", "settings"].contains(destination)
+            ? destination : (lastRead == nil ? "home" : "review")
+        pushState()
+    }
+
+    private func restoreSavedVehicles(preferred: String? = nil) {
+        let store = KeychainCredentialStore.shared
+        vehicleStore.reconcile(availableSerials: store.serials().filter { store.load(serial: $0) != nil })
+        if let preferred { _ = vehicleStore.select(preferred) }
+        state["vehicles"] = vehicleStore.serials.map {
+            ["sn": $0, "detail": "已配对，可直接连接", "paired": true] as [String: Any]
+        }
+        state["vehicleSn"] = vehicleStore.selectedSerial ?? ""
+        state["credentialAvailable"] = vehicleStore.selectedSerial != nil
+        state["selectedVehicleIndex"] = vehicleStore.serials.firstIndex(of: serial) ?? 0
+        refreshBackupState(serial: serial)
+    }
+
+    @discardableResult
+    private func selectVehicle(index value: String) -> Bool {
+        guard let index = Int(value), let vehicles = state["vehicles"] as? [[String: Any]],
+              vehicles.indices.contains(index), let candidate = vehicles[index]["sn"] as? String,
+              let selected = PairedVehicleStore.normalizedSerial(candidate) else {
+            state["errorMessage"] = "车辆列表已变化，请重新扫描并选择。"
+            state["modal"] = "operation-failed"
+            pushState()
+            return false
+        }
+        if selected != serial {
+            stopClient()
+            stopScanCountdown()
+            postWriteTimer?.cancel()
+            postWriteTimer = nil
+            postWriteCheck = nil
+            pendingWrite = nil
+            pendingUnverified = nil
+            pendingRetryRequest = nil
+            dumpPurpose = nil
+            preWriteDump = nil
+            gate = nil
+            lastRead = nil
+            lastPostWriteTarget = nil
+            lastAdaptationDump = nil
+            previousAdaptationDump = nil
+            lastDumpURL = nil
+            state["dumpReady"] = false
+            approvedMeterGates.removeAll()
+            state["connected"] = false
+            state["vehicleVoltage"] = NSNull()
+            state["vehicleCapacity"] = NSNull()
+            for key in ["soc", "batteryVoltage", "meterVoltage", "meterCapacity", "dashboardVoltage",
+                        "dashboardCapacity", "remainingCapacity", "meterFirmware", "dashboardFirmware",
+                        "colorDisplayFirmware", "centreFirmware"] { state[key] = "--" }
+        }
+        state["vehicleSn"] = selected
+        state["selectedVehicleIndex"] = index
+        state["credentialAvailable"] = KeychainCredentialStore.shared.load(serial: selected) != nil
+        _ = vehicleStore.select(selected)
+        refreshBackupState(serial: selected)
+        pushState()
+        return true
     }
 
     private func placeholderRecord(serial: String) -> DeviceRecord {
@@ -1306,13 +1061,6 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     /// Opens the next confirmation gate for the pending write.
     private func openGate() {
         guard let pending = pendingWrite else { return }
-        if !pending.isDashboard,
-           approvedMeterGates.contains("\(serial):\(pending.profile)") {
-            // This vehicle and target were already accepted in this session; the
-            // meter warning is asked once per target, not once per write.
-            startWrite(pending)
-            return
-        }
         if !pending.isDashboard {
             // The meter dialog is only worth showing if the snapshot it
             // promises can actually be read back.
@@ -1338,8 +1086,13 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             }
         }
 
-        // From policy, not a constant: expert mode waits longer so that a
-        // mis-tap stays reversible for long enough to notice it.
+        if !pending.isDashboard,
+           approvedMeterGates.contains("\(serial):\(pending.profile)") {
+            startWrite(pending)
+            return
+        }
+
+        // Preserve the original meter/dashboard confirmation times.
         let seconds: Int
         if pending.isDashboard {
             seconds = pending.stage == 0
@@ -1386,6 +1139,10 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     }
 
     private func startWrite(_ pending: PendingWrite) {
+        let dashboardTarget = pending.isDashboard
+            ? ((try? DisVoltageConfig.target(currentRaw: pending.expectedDisConfigRaw, voltage: pending.voltage)) ?? -1)
+            : -1
+        lastPostWriteTarget = (pending.isDashboard ? -1 : pending.profile, dashboardTarget, pending.isDashboard)
         state["writeStage"] = "writing"
         pushState()
         let record = placeholderRecord(serial: serial)
@@ -1414,21 +1171,28 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     // MARK: - Diagnostics
 
     private func exportDiagnostics() {
-        // Android wrote a file and shared it through FileProvider. iOS writes to
-        // the app's Documents directory; reaching it needs the file-sharing keys
-        // in Info.plist *and* a share path that does not depend on the Files app
-        // at all, which is what the button on the dialog is for.
+        let snapshot = diagnosticSnapshot()
         let url = Self.documentsDirectory().appendingPathComponent("bfg-diagnostic.txt")
-        let text = diagnosticReport()
-        do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            state["errorMessage"] = "\(url.lastPathComponent) · \(text.count) 字节，"
-                + "可在「文件」App 的本应用目录中找到，或直接用下面的分享按钮发出去。"
-        } catch {
-            state["errorMessage"] = "诊断导出失败：\(error.localizedDescription)"
+        let token = clientGeneration
+        ioQueue.async { [weak self] in
+            let outcome = Result { () -> Int in
+                let text = Self.renderDiagnostic(snapshot)
+                try text.write(to: url, atomically: true, encoding: .utf8)
+                return text.utf8.count
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.clientGeneration == token else { return }
+                switch outcome {
+                case .success(let bytes):
+                    self.state["errorMessage"] = "\(url.lastPathComponent) · \(bytes) 字节，已保存，可在文件 App 中查看或分享。"
+                    self.state["modal"] = "diagnostic-exported"
+                case .failure(let error):
+                    self.state["errorMessage"] = "诊断导出失败：" + error.localizedDescription
+                    self.state["modal"] = "operation-failed"
+                }
+                self.pushState()
+            }
         }
-        state["modal"] = "diagnostic-exported"
-        pushState()
     }
 
     // MARK: - Sharing exports
@@ -1479,8 +1243,8 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
     /// Everything the log had, plus the state a driver-side problem needs:
     /// which vehicle, what was last read, and which build produced it.
-    private func diagnosticReport() -> String {
-        var lines = [
+    private func diagnosticSnapshot() -> (header: [String], entries: [String]) {
+        let lines = [
             "BFG iOS diagnostic",
             "time      \(Self.timestamp())",
             "app       \(state["appVersion"] ?? "?")",
@@ -1496,13 +1260,17 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
             "",
             "--- log (\(diagnosticLog.count) lines) ---"
         ]
-        lines.append(contentsOf: diagnosticLog)
-        return lines.joined(separator: "\n") + "\n"
+        return (lines, diagnosticLog)
+    }
+
+    private static func renderDiagnostic(_ snapshot: (header: [String], entries: [String])) -> String {
+        (snapshot.header + snapshot.entries).joined(separator: "\n") + "\n"
     }
 
     /// A deliberate, slow sweep of the whole reachable bus, for adapting the
     /// tool to this vehicle rather than for guarding a write.
     private func startAdaptationDump() {
+        clearDeferredRead()
         // The versions live in the dashboard and centre modules, so those have
         // to be included for the fingerprint to identify the build.
         dumpPurpose = .adaptation
@@ -1515,25 +1283,30 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     }
 
     private func saveAdaptationDump(_ dump: RegisterDump) {
-        previousAdaptationDump = lastAdaptationDump
-        lastAdaptationDump = dump
-        let name = "bfg-dump-\(dump.serial)-\(dump.timestamp).json"
-        let url = Self.documentsDirectory().appendingPathComponent(name)
-        do {
-            try dump.json().write(to: url, options: .atomic)
-            lastDumpURL = url
-            state["errorMessage"] = "\(name) · \(dump.entries.count) 个地址，"
-                + "\(dump.respondedCount) 个有响应 · 指纹 \(dump.fingerprint.identifier)"
-        } catch {
-            state["errorMessage"] = "快照写入失败：\(error.localizedDescription)"
+        let token = clientGeneration
+        let url = Self.documentsDirectory().appendingPathComponent("bfg-dump-\(dump.serial)-\(dump.timestamp).json")
+        let previous = lastAdaptationDump
+        ioQueue.async { [weak self] in
+            let saved = Result { try dump.json().write(to: url, options: .atomic) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.clientGeneration == token else { return }
+                self.state["screen"] = "settings"
+                self.state["busyMessage"] = NSNull()
+                switch saved {
+                case .success:
+                    self.previousAdaptationDump = previous
+                    self.lastAdaptationDump = dump
+                    self.lastDumpURL = url
+                    self.state["dumpReady"] = previous != nil
+                    self.state["errorMessage"] = "\(url.lastPathComponent) · \(dump.entries.count) 个地址，\(dump.respondedCount) 个有响应。"
+                    self.state["modal"] = "dump-complete"
+                case .failure(let error):
+                    self.state["errorMessage"] = "快照保存失败：" + error.localizedDescription
+                    self.state["modal"] = "operation-failed"
+                }
+                self.pushState()
+            }
         }
-        // Only a *second* dump gives the compare button something to say. Leaving
-        // this true forever both outlived a vehicle change and offered a
-        // comparison whose only possible answer was "这是第一份快照".
-        state["dumpReady"] = previousAdaptationDump != nil
-        state["modal"] = "dump-complete"
-        state["busyMessage"] = NSNull()
-        pushState()
     }
 
     /// Compares the latest sweep against the previous one. This is the check
@@ -1547,6 +1320,13 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
         }
         guard let previous = previousAdaptationDump else {
             state["errorMessage"] = "这是第一份快照，已作为基线。"
+            state["modal"] = "dump-complete"
+            pushState()
+            return
+        }
+        guard latest.serial == serial, previous.serial == serial,
+              latest.fingerprint == previous.fingerprint else {
+            state["errorMessage"] = "两份快照的车辆或固件不同，请为当前车辆重新建立基线。"
             state["modal"] = "dump-complete"
             pushState()
             return
@@ -1566,22 +1346,38 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
     }
 
     private func clearLocalData() {
-        KeychainCredentialStore.shared.deleteAll()
-        backupStore.clear(serial: serial)
+        let serials = Set(vehicleStore.serials + KeychainCredentialStore.shared.serials() + [serial])
+        cancelOperation(destination: "settings")
+        guard KeychainCredentialStore.shared.deleteAll() else {
+            state["errorMessage"] = "钥匙串凭据未能清除，请解锁设备后重试。"
+            state["modal"] = "operation-failed"
+            pushState()
+            return
+        }
+        for serial in serials { backupStore.clear(serial: serial) }
+        vehicleStore.clear()
         lastRead = nil
-        pendingWrite = nil
-        pendingUnverified = nil
-        // The in-memory snapshots go too: keeping them would leave the compare
-        // button offering a comparison against data the rider just asked to
-        // forget, for the same reason the stored backups are dropped.
+        lastPostWriteTarget = nil
         lastAdaptationDump = nil
         previousAdaptationDump = nil
+        lastDumpURL = nil
+        approvedMeterGates.removeAll()
+        state["vehicleSn"] = ""
+        state["credentialAvailable"] = false
+        state["selectedVehicleIndex"] = 0
         state["dumpReady"] = false
         state["vehicles"] = []
         state["connected"] = false
-        state["errorMessage"] = "已清除本机保存的配对凭据与备份。再次使用需要重新配对。"
+        state["vehicleVoltage"] = NSNull()
+        state["vehicleCapacity"] = NSNull()
+        for key in ["soc", "batteryVoltage", "meterVoltage", "meterCapacity", "dashboardVoltage",
+                    "dashboardCapacity", "remainingCapacity", "meterFirmware", "dashboardFirmware",
+                    "colorDisplayFirmware", "centreFirmware"] { state[key] = "--" }
+        state["writeSupported"] = false
+        state["dashboardWriteSupported"] = false
+        state["errorMessage"] = "已清除本工具保存的车辆凭据和参数备份。再次使用需要重新配对。"
         state["modal"] = "data-cleared"
-        refreshBackupState(serial: serial)
+        refreshBackupState(serial: "")
         pushState()
     }
 
@@ -1711,6 +1507,10 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageReady = true
+        if !restoredVehicles {
+            restoredVehicles = true
+            restoreSavedVehicles()
+        }
         // The picker has to be usable before the first read, so the options are
         // seeded from the profile table rather than waiting for a connection.
         let options = Self.capacityOptions()
@@ -1728,19 +1528,12 @@ final class PrototypeCoordinator: NSObject, WKScriptMessageHandler, WKNavigation
 
 // MARK: - BLE listener
 
-extension PrototypeCoordinator: BfgBleClient.Listener {
+extension PrototypeCoordinator {
     /// Every listener callback arrives on the client's own BLE queue, but `state`
     /// and WKWebView are main-thread-only. Delivering them in place meant the
     /// page could be updated — and `state` mutated — from a background queue,
     /// which is how a status line or a failure notice goes missing and leaves
     /// the page showing a fallback caption instead. Each callback hops first.
-    func bleClient(didUpdateStatus status: String) { onMain { self.handleStatus(status) } }
-
-    func bleClient(didLog line: String) { onMain { self.handleLog(line) } }
-
-    func bleClient(didFinish result: BfgBleClient.Result) { onMain { self.handleFinish(result) } }
-
-    func bleClient(didFailWith message: String) { onMain { self.handleFailure(message) } }
 
     /// Runs `work` on the main thread, without a second hop when already there.
     private func onMain(_ work: @escaping () -> Void) {
@@ -1757,17 +1550,12 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
     /// even while the UI is wedged. Throttled, because the transport logs two
     /// lines per frame.
     private func persistDiagnosticIfActive() {
-        guard !diagnosticLog.isEmpty else { return }
-        let now = Date()
-        // Six seconds, not two: the buffer now holds twenty thousand lines, and
-        // re-joining a megabyte of text every couple of seconds while a sweep is
-        // running is work the main thread cannot spare.
-        guard now.timeIntervalSince(lastPersist) > 6 else { return }
-        lastPersist = now
-        let text = diagnosticReport()
+        guard !diagnosticLog.isEmpty, Date().timeIntervalSince(lastPersist) > 6 else { return }
+        lastPersist = Date()
+        let snapshot = diagnosticSnapshot()
         let url = Self.documentsDirectory().appendingPathComponent("bfg-diagnostic.txt")
-        DispatchQueue.global(qos: .utility).async {
-            try? text.write(to: url, atomically: true, encoding: .utf8)
+        ioQueue.async {
+            try? Self.renderDiagnostic(snapshot).write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
@@ -1780,7 +1568,8 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
         pushState()
     }
 
-    private func handleLog(_ line: String) {
+    private func handleLog(_ raw: String) {
+        let line = ProtocolLogSanitizer.sanitize(raw)
         // Surfaced through the page's log area when present.
         state["logLine"] = line
         // Stamp every stored line with seconds since the first one. The real
@@ -1812,30 +1601,19 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
     }
 
     private func handleFinish(_ result: BfgBleClient.Result) {
+        client = nil
+        clientListener = nil
         // A capacity write hands back both the value it replaced and the value
         // it produced. Persisting the first is what makes a rollback possible;
         // the second is kept so the export shows what the register actually
         // ended up as, not merely what was asked for.
-        state["capacityWriteEnabled"] = WriteAccessPolicy.allowsCapacityWrite
-        if result.disConfigRaw >= 0 {
-            state["disConfigRaw"] = String(format: "0x%04X", result.disConfigRaw)
-            let v = DisVoltageConfig.nominalVoltage(result.disConfigRaw)
-            state["disConfigVoltage"] = v > 0 ? "\(v)V" : "未识别"
-        }
-        if result.capacityRatedBefore > 0 {
-            backupStore.saveRatedCapacityBackupIfAbsent(serial: result.serial,
-                                                        raw: result.capacityRatedBefore)
-            backupStore.savePrewriteRatedCapacity(serial: result.serial,
-                                                  raw: result.capacityRatedBefore)
-            state["ratedCapacityBackup"] = result.capacityRatedBefore
-            refreshBackupState(serial: result.serial)
-        }
         state["pairScanning"] = false
         stopScanCountdown()
 
         if activeOperation == .discoverVehicles {
             state["vehicles"] = result.discoveredVehicles.map {
-                ["sn": $0.serial, "detail": "点击选择这台车"]
+                ["sn": $0.serial, "detail": "点击选择这台车",
+                 "paired": KeychainCredentialStore.shared.load(serial: $0.serial) != nil] as [String: Any]
             }
             state["busyMessage"] = NSNull()
             pushState()
@@ -1847,6 +1625,16 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
         // vehicle has settled or needs reading again.
         if postWriteCheck != nil, pendingWrite == nil, !result.writeCommandSent {
             handlePostWriteCheck(result)
+            return
+        }
+
+        if activeOperation == .registerScan {
+            state["scanReplies"] = result.registerScanReplies
+            state["scanTimeouts"] = result.registerScanTimeouts
+            state["busyMessage"] = NSNull()
+            state["errorMessage"] = ""
+            state["screen"] = "scan-result"
+            pushState()
             return
         }
 
@@ -1864,7 +1652,7 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
         // in front of the user with current values.
         if let retry = pendingRetryRequest, pendingWrite == nil, !result.writeCommandSent {
             pendingRetryRequest = nil
-            lastRead = result
+            applyReadResult(result)
             if let request = Self.parseWriteRequest(retry) {
                 state["writeType"] = request.type
                 state["voltage"] = request.voltage
@@ -1879,14 +1667,106 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
             return
         }
 
+        applyReadResult(result)
+
+        if pendingWrite != nil, !result.writeCommandSent {
+            guard let pending = pendingWrite else { return }
+
+            // The dashboard config the user confirmed against must still be the
+            // one on the vehicle; anything else means the basis of the choice
+            // has moved, so nothing is sent.
+            if pending.isDashboard, pending.expectedDisConfigRaw >= 0,
+               result.disConfigRaw != pending.expectedDisConfigRaw {
+                writeFailure("写入前发现仪表配置已变化，本次没有发送写入指令。"
+                    + "请重新核对当前参数后再试。")
+                return
+            }
+
+            // Nothing may be written unless the values that would be needed to
+            // get back are actually present.
+            let backupReady = pending.isDashboard
+                ? (result.disConfigRaw >= 0
+                    && DisVoltageConfig.nominalVoltage(result.disConfigRaw) > 0
+                    && DashboardWritePolicy.allows(dashboard: result.dashboardFirmware,
+                                                   colorDisplay: result.colorDisplayVersion,
+                                                   centre: result.centreControllerVersion,
+                                                   meter: result.meterFirmware))
+                : (result.profileRaw >= 0
+                    && result.displayBeforeCapacity > 0
+                    && (result.writeSupported))
+            guard backupReady else {
+                writeFailure("写入前未能完整读取并保存原参数，本次没有发送写入指令。"
+                    + "请保持车辆开机后重试。")
+                return
+            }
+
+            let token = clientGeneration
+            let store = backupStore
+            state["busyMessage"] = "正在保存写入前原参数…"
+            pushState()
+            ioQueue.async { [weak self] in
+                let saved = store.savePrewriteSnapshot(serial: result.serial,
+                    profile: result.profileRaw, capacity: result.displayBeforeCapacity,
+                    disConfigRaw: result.disConfigRaw)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.clientGeneration == token, self.pendingWrite != nil else { return }
+                    guard saved else {
+                        self.writeFailure("写入前未能完整保存原参数，没有发送写入指令。")
+                        return
+                    }
+                    self.refreshBackupState(serial: result.serial)
+                    self.beginPreWriteDump(pending)
+                }
+            }
+            return
+        }
+
+        pendingWrite = nil
+        pendingUnverified = nil
+        pushState()
+
+        guard result.writeCommandSent else {
+            // A plain read ends on the page that shows what was read *and* carries
+            // the write entry. It used to return home, which has neither: the
+            // rider saw a successful connection and then nothing, and the write
+            // flow was unreachable — reported, correctly, as "there is no option".
+            goTo("review")
+            return
+        }
+        guard result.profileReadbackVerified || result.disConfigReadbackVerified else {
+            state["screen"] = "review"
+            state["errorMessage"] = "写入指令可能已发送，但回读尚未确认。请重新核对，确认前不要重复写入。"
+            state["modal"] = "verification-incomplete"
+            pushState()
+            return
+        }
+
+        // The write's own read-back confirmed the value; the original still
+        // waits and reads again, because a vehicle can lag on the remaining
+        // capacity even after the profile has changed.
+        guard let target = lastPostWriteTarget else {
+            writeFailure("无法确认本次写入目标，请重新读取车辆参数。")
+            return
+        }
+        postWriteCheck = PostWriteCheck(expectedProfile: target.profile,
+                                        expectedDisConfig: target.disConfig)
+        goTo("post-write-check")
+        schedulePostWriteRead(after: 5)
+    }
+
+    /// Decides whether the delayed read settled the write, needs another, or
+    /// contradicts it. Reads only — a failed check never retries the write.
+    private func applyReadResult(_ result: BfgBleClient.Result) {
         lastRead = result
+        restoreSavedVehicles(preferred: result.serial)
         state["connected"] = true
         state["vehicleSn"] = result.serial
         // The page prints these verbatim, so they are formatted the same way the
         // Android client formatted them rather than passed through as raw values.
         state["soc"] = DisplayFormatter.soc(result.displaySoc)
         state["batteryVoltage"] = DisplayFormatter.batteryVoltage(result.disVrlaVoltage)
-        state["meterVoltage"] = DisplayFormatter.voltageName(result.profileRaw)
+        state["meterVoltage"] = DisplayFormatter.voltageName(
+            result.writeCommandSent && result.afterProfile >= 0 ? result.afterProfile : result.profileRaw)
         state["dashboardVoltage"] = DisplayFormatter.nominalVoltage(result.dashboardNominalVoltage)
         // After a write the meaningful figures are the post-write ones; showing
         // the pre-write values would make a successful write look like a no-op.
@@ -1968,90 +1848,14 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
 
         // A completed write ends the flow; a read that ran only to produce the
         // pre-write snapshot hands over to the risk gate instead.
-        if pendingWrite != nil, !result.writeCommandSent {
-            guard let pending = pendingWrite else { return }
-
-            // The dashboard config the user confirmed against must still be the
-            // one on the vehicle; anything else means the basis of the choice
-            // has moved, so nothing is sent.
-            if pending.isDashboard, pending.expectedDisConfigRaw >= 0,
-               result.disConfigRaw != pending.expectedDisConfigRaw {
-                writeFailure("写入前发现仪表配置已变化，本次没有发送写入指令。"
-                    + "请重新核对当前参数后再试。")
-                return
-            }
-
-            // Nothing may be written unless the values that would be needed to
-            // get back are actually present.
-            let backupReady = pending.isDashboard
-                ? (result.disConfigRaw >= 0
-                    && DisVoltageConfig.nominalVoltage(result.disConfigRaw) > 0
-                    && DashboardWritePolicy.allows(dashboard: result.dashboardFirmware,
-                                                   colorDisplay: result.colorDisplayVersion,
-                                                   centre: result.centreControllerVersion,
-                                                   meter: result.meterFirmware))
-                : (result.profileRaw >= 0
-                    && result.displayBeforeCapacity > 0
-                    && (result.writeSupported || WriteAccessPolicy.allowsUnverifiedCombination()))
-            guard backupReady else {
-                writeFailure("写入前未能完整读取并保存原参数，本次没有发送写入指令。"
-                    + "请保持车辆开机后重试。")
-                return
-            }
-
-            guard backupStore.savePrewriteSnapshot(serial: result.serial,
-                                                   profile: result.profileRaw,
-                                                   capacity: result.displayBeforeCapacity,
-                                                   disConfigRaw: result.disConfigRaw) else {
-                writeFailure("写入前未能完整读取并保存原参数，本次没有发送写入指令。"
-                    + "请保持车辆开机后重试。")
-                return
-            }
-            refreshBackupState(serial: result.serial)
-            pushState()
-            beginPreWriteDump(pending)
-            return
-        }
-
-        pendingWrite = nil
-        pendingUnverified = nil
-        pushState()
-
-        guard result.writeCommandSent else {
-            // A plain read ends on the page that shows what was read *and* carries
-            // the write entry. It used to return home, which has neither: the
-            // rider saw a successful connection and then nothing, and the write
-            // flow was unreachable — reported, correctly, as "there is no option".
-            goTo("review")
-            return
-        }
-        guard result.profileReadbackVerified || result.disConfigReadbackVerified else {
-            goTo("post-write-check")
-            return
-        }
-
-        // The write's own read-back confirmed the value; the original still
-        // waits and reads again, because a vehicle can lag on the remaining
-        // capacity even after the profile has changed.
-        lastPostWriteTarget = (result.afterProfile, result.disConfigAfterRaw,
-                               activeOperation == .writeDisVoltage)
-        postWriteCheck = PostWriteCheck(expectedProfile: result.afterProfile,
-                                        expectedDisConfig: result.disConfigAfterRaw)
-        goTo("post-write-check")
-        schedulePostWriteRead(after: 5)
     }
 
-    /// Decides whether the delayed read settled the write, needs another, or
-    /// contradicts it. Reads only — a failed check never retries the write.
     private func handlePostWriteCheck(_ result: BfgBleClient.Result) {
         guard var check = postWriteCheck else { return }
         check.attempts += 1
         postWriteCheck = check
 
-        lastRead = result
-        state["vehicleSn"] = result.serial
-        state["busyMessage"] = NSNull()
-        refreshBackupState(serial: result.serial)
+        applyReadResult(result)
 
         let matches = PostWriteCheckPolicy.targetMatches(
             actualProfile: result.profileRaw,
@@ -2080,6 +1884,7 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
         // that moved is the address that was written. Anything else changing is
         // the clearest early sign that a write reached further than intended.
         if preWriteDump != nil {
+            pendingCapacityAfterWrite = pending
             dumpPurpose = .postWrite
             state["busyMessage"] = "正在比对写入后的寄存器快照…"
             pushState()
@@ -2101,6 +1906,7 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
     }
 
     private func showWriteSuccess(capacityPending pending: Bool) {
+        state["screen"] = "review"
         state["result"] = "success"
         state["modal"] = "write-success"
         state["errorMessage"] = pending
@@ -2112,8 +1918,9 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
 
     private func schedulePostWriteRead(after seconds: Double) {
         postWriteTimer?.cancel()
+        let token = clientGeneration
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.postWriteCheck != nil else { return }
+            guard let self, self.clientGeneration == token, self.postWriteCheck != nil else { return }
             self.startClient(record: self.placeholderRecord(serial: self.serial),
                              operation: .compareRead)
         }
@@ -2122,6 +1929,8 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
     }
 
     private func handleFailure(_ message: String) {
+        client = nil
+        clientListener = nil
         // Read before the teardown below: which step of a multi-step flow died
         // decides where the rider has to land to see it.
         let failedPostWriteCheck = postWriteCheck != nil
@@ -2173,9 +1982,7 @@ extension PrototypeCoordinator: BfgBleClient.Listener {
         case .pairAndRead:
             state["screen"] = "pair-ready"
             state["modal"] = "operation-failed"
-        case .readOnly, .compareRead, .discoverVehicles, .writeProfile, .writeDisVoltage,
-             .writeCapacity, .probeRegisterWrites, .sweepCapacityValues,
-             .dashboardProbe, .dashboardScan:
+        case .readOnly, .compareRead, .discoverVehicles, .writeProfile, .writeDisVoltage:
             state["screen"] = "home"
             state["modal"] = "operation-failed"
         }
