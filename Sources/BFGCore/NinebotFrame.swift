@@ -61,6 +61,11 @@ public enum NinebotFrame {
         [0x5A, 0xA5, 0x01, 0x3E, 0x10, 0x02, 0x00, UInt8(profile & 0xFF)]
     }
 
+    /// Two-byte read used by the original capacity compatibility chain.
+    public static func readBfgWord(register: Int) -> [UInt8] {
+        [0x5A, 0xA5, 0x01, 0x3E, 0x10, 0x01, UInt8(register & 0xFF), 0x02]
+    }
+
     public static func authenticate(serial14: [UInt8]) throws -> [UInt8] {
         guard serial14.count == 14 else { throw Failure.serialMustBe14Bytes }
         return authenticateHeader + serial14
