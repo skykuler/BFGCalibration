@@ -28,7 +28,8 @@ public final class VirtualLink: BleTransport {
     ///   enough to keep tests quick, large enough that a reply never lands
     ///   inside the write call itself.
     public init(vehicle: VirtualVehicle, poweredOn: Bool = true,
-                latency: TimeInterval = 0.003) {
+                latency: TimeInterval = 0.003, notificationChunkSize: Int? = nil,
+                corruptPairConfirmation: Bool = false) {
         self.vehicle = vehicle
         self.isPoweredOn = poweredOn
         self.latency = latency
