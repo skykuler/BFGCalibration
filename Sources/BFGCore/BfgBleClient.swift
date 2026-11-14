@@ -16,51 +16,8 @@ public final class BfgBleClient: NSObject {
     // MARK: - Public surface
 
     public enum Operation {
-        case readOnly
-        case compareRead
-        case writeProfile
-        case writeDisVoltage
-        case pairAndRead
-        case registerScan
-        /// Collects nearby vehicles for the user to confirm before pairing,
-        /// rather than connecting to the first match.
-        case discoverVehicles
-        /// Sweeps a module's whole register space twice, so a write can be
-        /// measured against what the vehicle held beforehand.
-        case dumpRegisters
-        /// Writes the rated-capacity word at 0x0E — the second and only other
-        /// write site. Separate from `.writeProfile` on purpose: it carries its
-        /// own policy flag, its own rollback slot and its own watch window.
-        case writeCapacity
-        /// Asks which capacity candidates accept a write at all.
-        ///
-        /// Each address is written its OWN current value back, so a successful
-        /// probe changes nothing on the vehicle — it only distinguishes "this
-        /// register accepts a write" from "this register is read-only", which is
-        /// the question 0x0E answered with silence.
-        case probeRegisterWrites
-        /// Walks the firmware table's capacities upward from the vehicle's own
-        /// value, asking which ones this module will accept.
-        ///
-        /// The only mode where the tool deliberately writes a value it did not
-        /// read: every candidate is written and then immediately reverted, and the
-        /// revert is verified before the next candidate starts. If a revert cannot
-        /// be confirmed the run stops rather than continuing to drift.
-        case sweepCapacityValues
-        /// Reads the dashboard's own registers and logs every raw frame.
-        ///
-        /// No switch gates it because there is nothing to gate: this operation
-        /// contains no write. It exists because 0x92 — the dashboard's voltage
-        /// selector, and the configuration it enforces on the meter — was being
-        /// read on every connection and never recorded anywhere.
-        case dashboardProbe
-        /// Sweeps the dashboard's whole register space once, read-only, looking for
-        /// where it keeps the capacity it enforces on the meter.
-        ///
-        /// The dashboard only exposes eight registers through the named readers. If
-        /// it stores a rated capacity of its own — rather than reading it back from
-        /// the meter each time — it is in one of the other 248.
-        case dashboardScan
+        case readOnly, compareRead, writeProfile, writeDisVoltage
+        case pairAndRead, registerScan, discoverVehicles, dumpRegisters
     }
 
     public protocol Listener: AnyObject {
@@ -124,22 +81,6 @@ public final class BfgBleClient: NSObject {
         public var resolvedBeforeSoc = -1
         public var resolvedBeforeCapacityRaw = -1
         public var resolvedAfterCapacityRaw = -1
-        /// The rated-capacity register (0x0E) as it stood before and after a
-        /// capacity write. Exposed so the coordinator can persist both: the
-        /// before value is the rollback target, the after value is the evidence.
-        /// Which capacity candidates accepted a probe write, and which stayed
-        /// silent. The second list is the more useful one: it says the capacity
-        /// route needs a different mechanism, not a different value.
-        /// Which firmware-table capacities the module accepted, and which it
-        /// refused. Together they bound the range this module will honour, which
-        /// is the question the probe left open.
-        public var sweepAccepted: [Int] = []
-        public var sweepRefused: [Int] = []
-        public var probeWritable: [Int] = []
-        public var probeReadOnly: [Int] = []
-        public var capacityRatedBefore = -1
-        public var capacityRatedAfter = -1
-
         /// Android substitutes the scanned capacity for the raw 0x1C reading when
         /// the vehicle only resolved in compatibility mode. An unsupported
         /// combination reports no capacity rather than a misleading raw value.
@@ -193,23 +134,15 @@ public final class BfgBleClient: NSObject {
         case waitColorDisplayVersion, waitCentreControllerVersion
         case waitDisConfig, waitDisWriteAck, waitDisAfter
         case waitCapacityCompatScan, waitRegisterScan, waitDumpScan
-        case waitWriteAck, waitAfterProfile, waitAfterCapacity
-        case watchAfterWrite
-        case waitCapacityPreRead, waitCapacityWriteAck, waitAfterCapacityWrite, watchCapacity
-        case probePreRead, probeWrite, probeVerify
-        case sweepPreRead, sweepTryWrite, sweepVerify, sweepRestore, sweepRestoreVerify
-        case dashboardProbe, waitDashboardScan
+        case waitWriteAck, waitAfterProfile, waitAfterCapacity, watchAfterWrite
         case done
     }
 
     private weak var listener: Listener?
     private let operation: Operation
     private let targetProfile: Int
-    /// Target for `.writeCapacity`. Zero means "not a capacity write".
-    private let targetCapacity: Int
     /// What the sweep should look for. Supplied by the caller because the backup
     /// store lives in the app layer, not here — the core only compares numbers.
-    private let referenceCapacity: Int
     private let record: DeviceRecord
     private let result = Result()
 
@@ -254,8 +187,11 @@ public final class BfgBleClient: NSObject {
 
     /// Identifies the client's own queue, so a callback that already runs on it
     /// is not dispatched onto itself.
-    private static let queueKey = DispatchSpecificKey<UInt8>()
+    private static let queueKey = DispatchSpecificKey<UUID>()
+    private let queueID = UUID()
 
+    private var receiveBuffer = BleFrameBuffer()
+    private var timeoutToken: UInt64 = 0
     private var timeoutWork: DispatchWorkItem?
 
     // MARK: - Post-write watch
@@ -284,91 +220,7 @@ public final class BfgBleClient: NSObject {
     /// one hop is a restore — so the whole trace is kept and reported.
     private var watchTransitions: [String] = []
 
-    // MARK: - Capacity-register write (0x0E) and its watch
-    //
-    // Why this exists: the profile byte declares a capacity that 0x0E also
-    // holds, and a vehicle that finds the two disagreeing restores the
-    // declaration about 6.5 s later — measured, not guessed (write 0xD0 at
-    // T+164.41, applied T+166.57, held until T+173.14, reverted to the byte
-    // that agrees with the 26000 still in 0x0E). A tool that can only write
-    // the declaration can therefore never make a change survive.
-    //
-    // The watch samples THREE registers in rotation rather than one. The
-    // question is not only "did 0x0E stick" but "did the profile follow it, and
-    // did the mirror at 0x0F agree" — that triple is what distinguishes a
-    // self-consistent vehicle from one whose registers have drifted apart.
-    private var capacityRegVerifyAttempts = 0
-    private var capacityWatchTick = 0
-    private var capacityWatchStart = DispatchTime.now()
-    private var capacityWatchTimer: DispatchWorkItem?
-    private var capacityBefore = -1
-    private var capacityAfter = -1
-    private var capacityMirror = -1
-    private var capacityProfileSeen = -1
-    private var capacityChangedAt: Double = -1
-    private var capacityReverted = false
-
-    /// Probed in strict rotation so a three-register round still samples the
-    /// primary register often enough to timestamp a revert to within ~1.5 s.
-    private static let capacityProbeRotation = [0x0E, 0x0F, 0x00]
-
-    // MARK: - Register-write probe
-    //
-    // 0x0E answered a well-formed write frame with total silence: no BLE_RX, no
-    // WRITE_ACK, and the value unchanged across three re-reads. That is a
-    // different failure from the profile byte, which ACKs in ~13 ms and is then
-    // reverted by an upstream module. So before giving up on the capacity route,
-    // the tool asks the only question that matters: do ANY of the capacity
-    // registers accept a write?
-    //
-    // Every probe writes back the value it just read, so the vehicle ends where
-    // it started. What is being measured is the ACK, not the value.
-    private var probeQueue: [Int] = []
-    private var probeCursor = 0
-    private var probeRegister = -1
-    private var probeValue = -1
-    private var probeAckSeen = false
-    private var probeWritable: [Int] = []
-    private var probeReadOnly: [Int] = []
-
-    // MARK: - Capacity sweep
-    //
-    // The probe answered the binary question — 0x0E accepts writes — and left the
-    // real one open: it accepted 26000 and refused 55000, so the module has a
-    // range, not a lock. This walks that range using values the firmware table
-    // already names, smallest first, so the boundary is found in steps.
-    //
-    // Every candidate is reverted before the next one is attempted, and the
-    // revert is read back. sweepOriginal is captured once and never rewritten:
-    // if any step cannot restore it, the run stops with the register wherever it
-    // is rather than walking further away from where it started.
-    private var sweepCandidates: [Int] = []
-    private var sweepCursor = 0
-    private var sweepOriginal = -1
-    private var sweepValue = -1
-    private var sweepAckSeen = false
-    private var sweepAccepted: [Int] = []
-    private var sweepRefused: [Int] = []
-
-    // MARK: - Dashboard read-only probe
-    private var dashboardProbeCursor = 0
-    private var dashboardProbeReads = 0
-    private var dashboardProbeTimeouts = 0
-
-    // MARK: - Dashboard full sweep (read-only)
-    private var dashScanIndex = 0
-    private var dashScanReplies = 0
-    private var dashScanTimeouts = 0
-    private var dashScanValues: [Int: Int] = [:]
-    private var dashScanReference = -1
-
-    private func capacityWatchElapsed() -> Double {
-        Double(DispatchTime.now().uptimeNanoseconds &- capacityWatchStart.uptimeNanoseconds)
-            / 1_000_000_000
-    }
-    /// From policy, not a constant: expert mode watches longer, because a
-    /// vehicle nobody has validated is exactly where a forced revert shows up.
-    private var watchDuration: Double { WriteAccessPolicy.watchSeconds() }
+    private var watchDuration: Double { 30.0 }
     private static let watchInterval: Double = 0.5
     private let queue = DispatchQueue(label: "com.bfgtools.calibration.client")
 
@@ -395,8 +247,6 @@ public final class BfgBleClient: NSObject {
     private var awaitingCentralState = false
 
     public init(record: DeviceRecord, operation: Operation, targetProfile: Int = -1,
-             targetCapacity: Int = 0,
-             referenceCapacity: Int = 0,
          expectedDisConfigRaw: Int = -1, allowUnverifiedDis: Bool = false,
          dumpModules: [Int] = [],
          transport: BleTransport, credentialStore: CredentialStore,
@@ -404,8 +254,6 @@ public final class BfgBleClient: NSObject {
         self.record = record
         self.operation = operation
         self.targetProfile = targetProfile
-        self.targetCapacity = targetCapacity
-        self.referenceCapacity = referenceCapacity
         self.expectedDisConfigRaw = expectedDisConfigRaw
         self.allowUnverifiedDis = allowUnverifiedDis
         self.dumpModules = dumpModules
@@ -413,7 +261,7 @@ public final class BfgBleClient: NSObject {
         self.credentialStore = credentialStore
         self.listener = listener
         super.init()
-        queue.setSpecific(key: BfgBleClient.queueKey, value: 1)
+        queue.setSpecific(key: BfgBleClient.queueKey, value: queueID)
         transport.delegate = self
     }
 
@@ -426,6 +274,11 @@ public final class BfgBleClient: NSObject {
     }
 
     public func start() {
+        onQueue { [weak self] in self?.startOnQueue() }
+    }
+
+    private func startOnQueue() {
+        guard !finished, state == .idle else { return }
         do {
             // The original guards exactly the two write operations:
             //
@@ -524,12 +377,22 @@ public final class BfgBleClient: NSObject {
     }
 
     public func cancel() {
-        finishNow()
+        onQueue { self.finishNow() }
     }
 
     private func finishNow() {
         finished = true
-        timeoutWork?.cancel()
+        state = .done
+        awaitingCentralState = false
+        clearTimeout()
+        verifyWork?.cancel()
+        verifyWork = nil
+        watchTimer?.cancel()
+        watchTimer = nil
+        receiveBuffer.clear()
+        wipePassword()
+        for i in pairingPassword32.indices { pairingPassword32[i] = 0 }
+        crypto = nil
         transport.stopScan()
         transport.disconnect()
     }
@@ -549,14 +412,16 @@ public final class BfgBleClient: NSObject {
     }
 
     private func status(_ text: String) { listener?.bleClient(didUpdateStatus: text) }
-    private func log(_ text: String) { listener?.bleClient(didLog: text) }
+    private func log(_ text: String) { listener?.bleClient(didLog: ProtocolLogSanitizer.sanitize(text)) }
 
     // MARK: - Timeouts
 
     private func timeout(_ expected: State, _ seconds: Double, _ message: String) {
-        timeoutWork?.cancel()
+        clearTimeout()
+        let token = timeoutToken
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.finished, self.state == expected else { return }
+            guard let self, !self.finished, self.timeoutToken == token,
+                  self.state == expected else { return }
             self.handleTimeout(expected, message)
         }
         timeoutWork = work
@@ -586,76 +451,6 @@ public final class BfgBleClient: NSObject {
                 log("仪表配置无回复；使用已有读数继续。")
                 afterDisConfigRead()
             }
-
-        case .waitDashboardScan:
-            // A silent address is normal across 256 of them.
-            dashScanTimeouts += 1
-            advanceDashboardScan()
-
-        case .dashboardProbe:
-            // A silent dashboard register is recorded and skipped: the gap is
-            // part of what the probe is reporting.
-            let missing = NinebotFrame.dashboardProbePlan[dashboardProbeCursor]
-            log(String(format: "DISPROBE index=0x%02X 无回复（%@）", missing.index, missing.label))
-            dashboardProbeCursor += 1
-            dashboardProbeTimeouts += 1
-            advanceDashboardProbe()
-
-        case .sweepPreRead:
-            // Without a baseline there is nothing to revert to, so this one stops
-            // before any write rather than carrying on.
-            fail("试探前无法读取 0x0E 原值；本次没有发送任何写入指令。")
-
-        case .sweepTryWrite:
-            // Silent is a result here too: fall through to the read-back, which
-            // decides by the register rather than by the ACK.
-            log(String(format: "SWEEP_ACK v=%d 无（车沉默）", sweepValue))
-            readBackSweepValue()
-
-        case .sweepVerify:
-            // Still has to be reverted: an unreadable value is not a reason to
-            // leave the register holding a candidate.
-            log(String(format: "SWEEP_RESULT v=%d 回读无回复 → 拒绝", sweepValue))
-            sweepRefused.append(sweepValue)
-            restoreSweepValue()
-
-        case .sweepRestore:
-            fail(String(format: "恢复写入无回复；0x0E 可能仍停留在 %d，请重新连接核对后再试。",
-                        sweepValue))
-
-        case .sweepRestoreVerify:
-            fail(String(format: "恢复后无法回读确认；0x0E 状态未知（原值 %d，最后一次写入 %d）。"
-                        + "请重新连接并核对。", sweepOriginal, sweepValue))
-
-        case .probePreRead:
-            log(String(format: "PROBE_RESULT 0x%02X 预读无回复，跳过", probeRegister))
-            advanceProbe()
-
-        case .probeVerify:
-            // A silent re-read after a silent write is the read-only signature,
-            // not an error: 0x0E behaved exactly this way.
-            log(String(format: "PROBE_RESULT 0x%02X 回读无回复 → 只读", probeRegister))
-            probeReadOnly.append(probeRegister)
-            advanceProbe()
-
-        case .waitCapacityPreRead:
-            // No pre-read, no backup, no write. This is the one timeout in the
-            // capacity path that must terminate rather than retry into a write.
-            fail("写入前未能读到 0x0E 原值，没有可回滚的备份；本次没有发送写入指令。")
-
-        case .waitAfterCapacityWrite:
-            if capacityRegVerifyAttempts < NinebotFrame.maxCapacityVerifyAttempts {
-                result.verificationRetried = true
-                requestCapacityWriteVerify()
-            } else {
-                fail("容量写入指令已发送，但多次回读无回复；请重新连接读取当前配置。")
-            }
-
-        case .watchCapacity:
-            // A dropped reply during a 90 s rotation is not a reason to stop:
-            // the gap is itself part of the shape being measured.
-            log(String(format: "CAP_WATCH T+%6.2fs 回读无回复", capacityWatchElapsed()))
-            scheduleCapacityWatchTick(after: Self.watchInterval)
 
         case .watchAfterWrite:
             // One unanswered sample must not end the watch: the point is the
@@ -706,11 +501,16 @@ public final class BfgBleClient: NSObject {
         }
     }
 
-    private func clearTimeout() { timeoutWork?.cancel() }
+    private func clearTimeout() {
+        timeoutToken &+= 1
+        timeoutWork?.cancel()
+        timeoutWork = nil
+    }
 
     // MARK: - Sending
 
     private func send(_ plain: [UInt8]) {
+        guard !finished else { return }
         guard let crypto else {
             fail("加密会话未建立")
             return
@@ -719,8 +519,9 @@ public final class BfgBleClient: NSObject {
             let counter = nextCounter
             nextCounter += 1
             let encrypted = try crypto.encryptSn(plain, counter: counter)
-            log(NinebotFrame.isFrame(plain, src: 0x3E, dst: 0x04, cmd: 0x5D)
-                ? "TX ctr=\(counter) AUTH 身份数据已隐藏"
+            let authentication = plain.count >= 7 && plain[3] == 0x3E
+                && plain[4] == 0x04 && [UInt8(0x5B), 0x5C, 0x5D].contains(plain[5])
+            log(authentication ? "TX ctr=\(counter) authentication payload hidden"
                 : "TX ctr=\(counter) plain=\(Hex.encode(plain))")
             transport.write(Data(encrypted))
         } catch {
@@ -729,6 +530,7 @@ public final class BfgBleClient: NSObject {
     }
 
     private func sendRaw(_ bytes: [UInt8]) {
+        guard !finished else { return }
         transport.write(Data(bytes))
     }
 
@@ -738,29 +540,19 @@ public final class BfgBleClient: NSObject {
         guard !finished, !encrypted.isEmpty else { return }
         do {
             switch state {
-            case .waitPreComm:
-                try handlePreComm(encrypted)
-            case .waitPairConfirm:
-                try handlePairConfirm(encrypted)
+            case .waitPreComm: try handlePreComm(encrypted)
+            case .waitPairConfirm: try handlePairConfirm(encrypted)
             case .waitAuth, .waitBeforeProfile, .waitBeforeSoc, .waitBeforeCapacity,
                  .waitDisDashboardVersion, .waitDisEnergyWh, .waitDisRemainingCapacity,
                  .waitDisBattery, .waitDisVrlaVoltage, .waitDisBfgVersion,
                  .waitColorDisplayVersion, .waitCentreControllerVersion,
-                 .waitDisConfig, .waitDisWriteAck, .waitDisAfter,
-                 .waitCapacityCompatScan, .waitRegisterScan, .waitDumpScan,
-                 .waitWriteAck, .waitAfterProfile, .waitAfterCapacity,
-                 .watchAfterWrite,
-                 .waitCapacityPreRead, .waitCapacityWriteAck, .waitAfterCapacityWrite, .watchCapacity,
-                 .probePreRead, .probeWrite, .probeVerify,
-                 .sweepPreRead, .sweepTryWrite, .sweepVerify, .sweepRestore, .sweepRestoreVerify,
-                 .dashboardProbe, .waitDashboardScan:
+                 .waitDisConfig, .waitDisWriteAck, .waitDisAfter, .waitCapacityCompatScan,
+                 .waitRegisterScan, .waitDumpScan, .waitWriteAck, .waitAfterProfile,
+                 .waitAfterCapacity, .watchAfterWrite:
                 try handleSessionReply(encrypted)
-            default:
-                break
+            default: break
             }
-        } catch {
-            fail(describe(error))
-        }
+        } catch { fail(describe(error)) }
     }
 
     private func handlePreComm(_ encrypted: [UInt8]) throws {
@@ -787,7 +579,13 @@ public final class BfgBleClient: NSObject {
                 "PRE_COMM未返回车辆SN"])
         }
 
-        result.serial = serial
+        guard let identity = PairedVehicleStore.normalizedSerial(serial),
+              identity == discoveredSerial,
+              record.effectiveSn.isEmpty || identity == record.effectiveSn.uppercased() else {
+            throw NSError(domain: "bfg", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "车辆序列号与所选设备不一致，已停止操作"])
+        }
+        result.serial = identity
         clearTimeout()
 
         if operation == .pairAndRead {
@@ -851,6 +649,10 @@ public final class BfgBleClient: NSObject {
     private func handlePairConfirm(_ encrypted: [UInt8]) throws {
         guard let crypto else { throw BleError.txNotReady }
         let decoded = try crypto.decryptSn(encrypted)
+        guard decoded.macOk else {
+            throw NSError(domain: "bfg", code: 8,
+                          userInfo: [NSLocalizedDescriptionKey: "配对回复校验失败，没有保存凭据"])
+        }
         let plain = decoded.plain
         guard NinebotFrame.isFrame(plain, src: 0x04, dst: 0x3E, cmd: 0x5C), plain.count == 7 else {
             return
@@ -1085,148 +887,6 @@ public final class BfgBleClient: NSObject {
             result.resolvedAfterCapacityRaw = result.afterCapacityRaw
             clearTimeout()
             beginProfileWatch()
-
-        case .waitDashboardScan:
-            guard NinebotFrame.isFrame(plain, src: 0x01, dst: 0x3E, cmd: 0x04) else { return }
-            clearTimeout()
-            let scanIdx = Int(plain[6])
-            let scanValue = plain.count >= 9 ? NinebotFrame.readLe16(plain, offset: 7) : -1
-            dashScanReplies += 1
-            if scanValue >= 0 {
-                dashScanValues[scanIdx] = scanValue
-                log(String(format: "DISCAN 0x%02X=%d raw=%@", scanIdx, scanValue, Hex.encode(plain)))
-            }
-            advanceDashboardScan()
-
-        case .dashboardProbe:
-            let dashIdx = try requireReadAck(plain, src: 0x01, len: 9)
-            guard dashIdx == NinebotFrame.dashboardProbePlan[dashboardProbeCursor].index else { return }
-            clearTimeout()
-            _ = recordDashboardProbe(plain: plain)
-
-        case .sweepPreRead:
-            let sweepIdx = try requireReadAck(plain, src: 0x10, len: 9)
-            guard sweepIdx == NinebotFrame.capacityWriteIndex, plain.count >= 9 else { return }
-            clearTimeout()
-            let sweepNow = NinebotFrame.readLe16(plain, offset: 7)
-            if sweepOriginal < 0 {
-                // Captured once, never rewritten: every candidate is reverted to
-                // this exact value, so it has to be the vehicle's own.
-                sweepOriginal = sweepNow
-                sweepCandidates = WriteAccessPolicy.sweepCandidates(from: sweepNow)
-                result.capacityRatedBefore = sweepNow
-                let list = sweepCandidates.map(String.init).joined(separator: " ")
-                log("SWEEP_BEGIN 原值=\(sweepNow)，候选 \(sweepCandidates.count) 个（均来自固件表）：\(list)")
-                if sweepCandidates.isEmpty {
-                    fail("固件表里没有不低于当前值 \(sweepNow) 的候选容量；本次没有发送任何写入指令。")
-                    return
-                }
-            } else if sweepNow != sweepOriginal {
-                log(String(format: "SWEEP_ABORT 0x0E 已被改动：期望 %d 实际 %d",
-                           sweepOriginal, sweepNow))
-                fail(String(format: "0x0E 在试探过程中被改动（期望 %d，实际 %d）；"
-                            + "为免继续偏离，试探已中止。请重新连接核对。",
-                            sweepOriginal, sweepNow))
-                return
-            }
-            advanceSweep()
-
-        case .sweepTryWrite:
-            guard NinebotFrame.isFrame(plain, src: 0x10, dst: 0x3E, cmd: 0x05) else { return }
-            sweepAckSeen = true
-            log(String(format: "SWEEP_ACK v=%d %@", sweepValue, Hex.encode(plain)))
-            clearTimeout()
-            readBackSweepValue()
-
-        case .sweepVerify:
-            let sweepAfterIdx = try requireReadAck(plain, src: 0x10, len: 9)
-            guard sweepAfterIdx == NinebotFrame.capacityWriteIndex, plain.count >= 9 else { return }
-            clearTimeout()
-            concludeSweepValue(NinebotFrame.readLe16(plain, offset: 7))
-
-        case .sweepRestore:
-            guard NinebotFrame.isFrame(plain, src: 0x10, dst: 0x3E, cmd: 0x05) else { return }
-            log(String(format: "SWEEP_RESTORE_ACK %@", Hex.encode(plain)))
-            clearTimeout()
-            verifySweepRestore()
-
-        case .sweepRestoreVerify:
-            let sweepRestoreIdx = try requireReadAck(plain, src: 0x10, len: 9)
-            guard sweepRestoreIdx == NinebotFrame.capacityWriteIndex, plain.count >= 9 else { return }
-            clearTimeout()
-            concludeSweepRestore(NinebotFrame.readLe16(plain, offset: 7))
-
-        case .probePreRead:
-            let probePre = try requireReadAck(plain, src: 0x10, len: 9)
-            guard probePre == probeRegister, plain.count >= 9 else { return }
-            clearTimeout()
-            probeValue = NinebotFrame.readLe16(plain, offset: 7)
-            log(String(format: "PROBE_PREREAD 0x%02X=%d", probeRegister, probeValue))
-            proceedProbeWrite()
-
-        case .probeWrite:
-            guard NinebotFrame.isFrame(plain, src: 0x10, dst: 0x3E, cmd: 0x05) else { return }
-            probeAckSeen = true
-            log(String(format: "PROBE_ACK 0x%02X %@", probeRegister, Hex.encode(plain)))
-            clearTimeout()
-            finishProbeRegister()
-
-        case .probeVerify:
-            let probeAfter = try requireReadAck(plain, src: 0x10, len: 9)
-            guard probeAfter == probeRegister, plain.count >= 9 else { return }
-            clearTimeout()
-            concludeProbeRegister(NinebotFrame.readLe16(plain, offset: 7))
-
-        case .waitCapacityPreRead:
-            let preIndex = try requireReadAck(plain, src: 0x10, len: 9)
-            guard preIndex == NinebotFrame.capacityWriteIndex, plain.count >= 9 else { return }
-            clearTimeout()
-            capacityBefore = NinebotFrame.readLe16(plain, offset: 7)
-            log(String(format: "CAP_WRITE_PREREAD 0x%02X=%d",
-                       NinebotFrame.capacityWriteIndex, capacityBefore))
-            proceedCapacityWrite()
-
-        case .waitCapacityWriteAck:
-            guard NinebotFrame.isFrame(plain, src: 0x10, dst: 0x3E, cmd: 0x05) else { return }
-            result.writeAckSeen = true
-            result.writeAckFrame = Hex.encode(plain)
-            log("CAP_WRITE_ACK=" + result.writeAckFrame)
-            scheduleVerify(after: 1.0) { [weak self] in self?.verifyCapacityWriteSafely() }
-
-        case .waitAfterCapacityWrite:
-            let index = try requireReadAck(plain, src: 0x10, len: 9)
-            guard index == NinebotFrame.capacityWriteIndex, plain.count >= 9 else { return }
-            let value = NinebotFrame.readLe16(plain, offset: 7)
-            clearTimeout()
-            if capacityBefore < 0 { capacityBefore = value }
-            capacityAfter = value
-            result.capacityRatedBefore = capacityBefore
-            result.capacityRatedAfter = value
-            log(String(format: "CAP_WRITE_READBACK 0x%02X before=%d after=%d target=%d",
-                       NinebotFrame.capacityWriteIndex, capacityBefore, value, targetCapacity))
-            if value == targetCapacity {
-                result.capacityReadbackVerified = true
-                beginCapacityWatch()
-            } else if capacityRegVerifyAttempts < NinebotFrame.maxCapacityVerifyAttempts {
-                result.verificationRetried = true
-                scheduleVerify(after: 1.0) { [weak self] in self?.requestCapacityWriteVerify() }
-            } else {
-                fail(String(format: "连续%d次回读 0x%02X 仍为 %d，目标 %d",
-                            capacityRegVerifyAttempts, NinebotFrame.capacityWriteIndex,
-                            value, targetCapacity))
-            }
-
-        case .watchCapacity:
-            // Length differs per register: 0x00 answers with one byte, the
-            // capacity words with two. Parsing by the echoed index rather than
-            // by a fixed width is what keeps the rotation honest.
-            guard let index = try? requireReadAck(plain, src: 0x10, len: 8) else { return }
-            clearTimeout()
-            let sampled = (index == 0x00)
-                ? Int(plain[7])
-                : (plain.count >= 9 ? NinebotFrame.readLe16(plain, offset: 7) : -1)
-            recordCapacitySample(register: index, value: sampled)
-            scheduleCapacityWatchTick(after: Self.watchInterval)
 
         case .watchAfterWrite:
             // The same read the verify step used; here it is sampled on a
@@ -1478,7 +1138,7 @@ public final class BfgBleClient: NSObject {
             dumpEntries.append(RegisterDump.Entry(
                 module: module, index: index,
                 length: RegisterReadPlan.probeLength(module: module, index: index),
-                value: value, stable: first == nil || first == value, responded: true))
+                value: value, stable: first != nil && first == value, responded: true))
         }
     }
 
@@ -1597,41 +1257,13 @@ public final class BfgBleClient: NSObject {
         switch operation {
         case .writeDisVoltage:
             beginDisVoltageWrite()
-        case .dashboardScan:
-            beginDashboardScan()
-
-        case .dashboardProbe:
-            beginDashboardProbe()
-
-        case .sweepCapacityValues:
-            guard WriteAccessPolicy.allowsCapacitySweep else {
-                fail("容量值试探未开启；本次没有发送任何写入指令。")
-                return
-            }
-            beginSweepRun()
-
-        case .probeRegisterWrites:
-            guard WriteAccessPolicy.allowsRegisterProbe else {
-                fail("寄存器写入探测未开启；本次没有发送任何写入指令。")
-                return
-            }
-            beginProbeRun()
-
-        case .writeCapacity:
-            guard WriteAccessPolicy.isWritableCapacity(targetCapacity) else {
-                fail("容量写入未获许可，或目标值超出合理范围（5000–100000 mAh）；"
-                    + "本次没有发送写入指令。")
-                return
-            }
-            beginCapacityWrite()
-
         case .writeProfile:
             // A combination the author never validated is a statement about his
             // test coverage, not about the vehicle in front of the rider. Expert
             // mode proceeds — with every safety rail below still in force — and
             // records in the log that it did so, so the export can never be read
             // as a validated run.
-            guard decision.writeSupported || WriteAccessPolicy.allowsUnverifiedCombination() else {
+            guard decision.writeSupported else {
                 fail("当前仪表与计量模块组合尚未通过写入验证；"
                     + "本次没有发送写入。请先导出诊断数据用于适配。")
                 return
@@ -1812,471 +1444,7 @@ public final class BfgBleClient: NSObject {
         log(String(format: "WATCH T+%6.2fs profile=0x%02X%@", now, value, note))
     }
 
-    // MARK: - Capacity write implementation
-
-    /// Reads 0x0E BEFORE anything is written.
-    ///
-    /// Without the old value there is nothing to roll back to, so the read is not
-    /// an optimisation — it is the precondition. A capacity write that cannot say
-    /// what it replaced must not happen at all.
-    private func beginCapacityWrite() {
-        state = .waitCapacityPreRead
-        capacityRegVerifyAttempts = 0
-        capacityBefore = -1
-        status("正在读取 0x0E 原值（写入前备份）…")
-        send(NinebotFrame.readBfgWord(register: NinebotFrame.capacityWriteIndex))
-        timeout(.waitCapacityPreRead, 4.5, "写入前读取 0x0E 无回复")
-    }
-
-    /// Only reached once the old value is in hand and persisted.
-    private func proceedCapacityWrite() {
-        guard capacityBefore > 0 else {
-            fail("未能读到 0x0E 原值，没有可回滚的备份；本次没有发送写入指令。")
-            return
-        }
-        let frame = NinebotFrame.writeCapacityRated(targetCapacity)
-        log(String(format: "CAP_WRITE_BEGIN target=%d addr=0x%02X before=%d frame=%@",
-                   targetCapacity, NinebotFrame.capacityWriteIndex, capacityBefore,
-                   Hex.encode(frame)))
-        status(String(format: "准备把 0x%02X 从 %d 写成 %d…",
-                      NinebotFrame.capacityWriteIndex, capacityBefore, targetCapacity))
-        state = .waitCapacityWriteAck
-        send(frame)
-        result.writeCommandSent = true
-        scheduleVerify(after: 2.4) { [weak self] in self?.verifyCapacityWriteSafely() }
-    }
-
-    private func verifyCapacityWriteSafely() {
-        guard !finished, state == .waitCapacityWriteAck else { return }
-        state = .waitAfterCapacityWrite
-        requestCapacityWriteVerify()
-    }
-
-    private func requestCapacityWriteVerify() {
-        capacityRegVerifyAttempts += 1
-        if capacityRegVerifyAttempts > 1 { result.verificationRetried = true }
-        status(String(format: "正在回读 0x%02X（%d/%d）…",
-                      NinebotFrame.capacityWriteIndex, capacityRegVerifyAttempts,
-                      NinebotFrame.maxCapacityVerifyAttempts))
-        send(NinebotFrame.readBfgWord(register: NinebotFrame.capacityWriteIndex))
-        timeout(.waitAfterCapacityWrite, 4.5, "容量写入后回读无回复")
-    }
-
-    private func beginCapacityWatch() {
-        capacityWatchStart = DispatchTime.now()
-        capacityWatchTick = 0
-        capacityChangedAt = -1
-        capacityReverted = false
-        capacityMirror = -1
-        capacityProfileSeen = -1
-        state = .watchCapacity
-        log(String(format: "CAP_WATCH_BEGIN 0x0E 已确认 %d；观察 %g 秒，每 %g 秒轮转读 0x0E/0x0F/0x00",
-                   capacityAfter, WriteAccessPolicy.watchSeconds(), Self.watchInterval))
-        status(String(format: "容量已确认；正在观察 %g 秒，同时盯着档位和镜像寄存器…",
-                      WriteAccessPolicy.watchSeconds()))
-        scheduleCapacityWatchTick(after: Self.watchInterval)
-    }
-
-    private func scheduleCapacityWatchTick(after seconds: Double) {
-        capacityWatchTimer?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.sendCapacityWatchProbe() }
-        capacityWatchTimer = work
-        queue.asyncAfter(deadline: .now() + seconds, execute: work)
-    }
-
-    private func sendCapacityWatchProbe() {
-        guard !finished, state == .watchCapacity else { return }
-        if capacityWatchElapsed() >= WriteAccessPolicy.watchSeconds() {
-            endCapacityWatch()
-            return
-        }
-        let register = Self.capacityProbeRotation[capacityWatchTick % Self.capacityProbeRotation.count]
-        capacityWatchTick += 1
-        send(NinebotFrame.readBfgWord(register: register))
-        timeout(.watchCapacity, 2.0, "容量观察窗口回读无回复")
-    }
-
-    /// One sample. Each register keeps its own last value so a change can be
-    /// attributed to the register that actually moved.
-    private func recordCapacitySample(register: Int, value: Int) {
-        let now = capacityWatchElapsed()
-        var note = ""
-        switch register {
-        case NinebotFrame.capacityWriteIndex:
-            if capacityAfter >= 0, value != capacityAfter, capacityChangedAt < 0 {
-                capacityChangedAt = now
-                capacityReverted = true
-                note = String(format: " ← 变化 %d→%d", capacityAfter, value)
-            }
-            capacityAfter = value
-        case 0x0F:
-            if capacityMirror >= 0, value != capacityMirror {
-                note = String(format: " ← 变化 %d→%d", capacityMirror, value)
-                if capacityChangedAt < 0 { capacityChangedAt = now }
-            }
-            capacityMirror = value
-        default:
-            if capacityProfileSeen >= 0, value != capacityProfileSeen {
-                note = String(format: " ← 变化 0x%02X→0x%02X", capacityProfileSeen, value)
-                if capacityChangedAt < 0 { capacityChangedAt = now }
-            }
-            capacityProfileSeen = value
-        }
-        log(String(format: "CAP_WATCH T+%6.2fs 0x%02X=%d (profile=%@) %@",
-                   now, register, value,
-                   capacityProfileSeen < 0 ? "-" : String(format: "0x%02X", capacityProfileSeen),
-                   note))
-    }
-
-    private func endCapacityWatch() {
-        // Recorded even when the value reverted: "what it became" is the
-        // finding, and an export that only carried the target would hide it.
-        result.capacityRatedBefore = capacityBefore
-        result.capacityRatedAfter = capacityAfter
-        capacityWatchTimer?.cancel()
-        capacityWatchTimer = nil
-        log(String(format: "CAP_WATCH_END 0x0E=%d 0x0F=%d profile=%@ changedAt=%@",
-                   capacityAfter, capacityMirror,
-                   capacityProfileSeen < 0 ? "-" : String(format: "0x%02X", capacityProfileSeen),
-                   capacityChangedAt < 0 ? "none" : String(format: "T+%.2fs", capacityChangedAt)))
-        if capacityReverted {
-            finish(String(format:
-                "容量写入 %d mAh 曾生效，但在 T+%.2fs 被车辆改回。详见 CAP_WATCH 行。",
-                targetCapacity, capacityChangedAt))
-        } else {
-            finish(String(format: "容量写入 %d mAh 已确认并保持稳定 %g 秒。",
-                          targetCapacity, WriteAccessPolicy.watchSeconds()))
-        }
-    }
-
-    // MARK: - Register-write probe implementation
-
-    private func beginProbeRun() {
-        probeQueue = WriteAccessPolicy.probeRegisterAllowlist
-        probeCursor = 0
-        probeWritable = []
-        probeReadOnly = []
-        let names = probeQueue.map { String(format: "0x%02X", $0) }.joined(separator: " ")
-        log("PROBE_BEGIN 候选 \(probeQueue.count) 个：\(names)（每个都写回它自己的当前值，车辆状态不变）")
-        status("开始探测 \(probeQueue.count) 个容量候选寄存器；每个都写回原值…")
-        advanceProbe()
-    }
-
-    private func advanceProbe() {
-        guard probeCursor < probeQueue.count else {
-            endProbeRun()
-            return
-        }
-        probeRegister = probeQueue[probeCursor]
-        probeCursor += 1
-        probeValue = -1
-        probeAckSeen = false
-        state = .probePreRead
-        status(String(format: "探测 0x%02X（%d/%d）：先读当前值…",
-                      probeRegister, probeCursor, probeQueue.count))
-        send(NinebotFrame.readBfgWord(register: probeRegister))
-        timeout(.probePreRead, 4.5, String(format: "探测 0x%02X 预读无回复", probeRegister))
-    }
-
-    /// Writes the value that was just read. Nothing changes if it lands.
-    private func proceedProbeWrite() {
-        guard probeValue >= 0 else {
-            log(String(format: "PROBE_RESULT 0x%02X 读不到当前值，跳过", probeRegister))
-            advanceProbe()
-            return
-        }
-        guard let frame = NinebotFrame.writeBfgWord(register: probeRegister, value: probeValue) else {
-            log(String(format: "PROBE_RESULT 0x%02X 不在白名单，跳过", probeRegister))
-            advanceProbe()
-            return
-        }
-        log(String(format: "PROBE_WRITE 0x%02X value=%d frame=%@",
-                   probeRegister, probeValue, Hex.encode(frame)))
-        state = .probeWrite
-        send(frame)
-        result.writeCommandSent = true
-        // No ACK is itself an answer, so the timeout advances instead of failing.
-        scheduleVerify(after: 2.0) { [weak self] in self?.finishProbeRegister() }
-    }
-
-    /// Settles one register and moves to the next.
-    private func finishProbeRegister() {
-        guard !finished, state == .probeWrite || state == .probeVerify else { return }
-        state = .probeVerify
-        send(NinebotFrame.readBfgWord(register: probeRegister))
-        timeout(.probeVerify, 3.0, String(format: "探测 0x%02X 回读无回复", probeRegister))
-    }
-
-    private func concludeProbeRegister(_ after: Int) {
-        let accepted = probeAckSeen && after == probeValue
-        if accepted {
-            probeWritable.append(probeRegister)
-        } else {
-            probeReadOnly.append(probeRegister)
-        }
-        log(String(format: "PROBE_RESULT 0x%02X ack=%@ before=%d after=%d → %@",
-                   probeRegister, probeAckSeen ? "有" : "无",
-                   probeValue, after, accepted ? "可写" : "只读"))
-        advanceProbe()
-    }
-
-    private func endProbeRun() {
-        let w = probeWritable.map { String(format: "0x%02X", $0) }.joined(separator: " ")
-        let r = probeReadOnly.map { String(format: "0x%02X", $0) }.joined(separator: " ")
-        log("PROBE_END 可写: \(w.isEmpty ? "无" : w) | 只读: \(r.isEmpty ? "无" : r)")
-        result.probeWritable = probeWritable
-        result.probeReadOnly = probeReadOnly
-        if probeWritable.isEmpty {
-            finish("探测完成：\(probeQueue.count) 个候选寄存器全部不接受写入。"
-                + "容量这条路需要另一条写入路径，详见 PROBE_ 日志。")
-        } else {
-            finish("探测完成：可写 \(w)；只读 \(r.isEmpty ? "无" : r)。详见 PROBE_ 日志。")
-        }
-    }
-
-    // MARK: - Capacity sweep implementation
-
-    private func beginSweepRun() {
-        // Candidates are derived after the first read, because the list starts at
-        // the vehicle's own value. A placeholder keeps the API honest: nothing is
-        // written until sweepOriginal is known.
-        sweepCandidates = []
-        sweepCursor = 0
-        sweepOriginal = -1
-        sweepAccepted = []
-        sweepRefused = []
-        state = .sweepPreRead
-        status("容量值试探：先读取当前值作为基准…")
-        send(NinebotFrame.readBfgWord(register: NinebotFrame.capacityWriteIndex))
-        timeout(.sweepPreRead, 4.5, "试探前读取 0x0E 无回复")
-    }
-
-    private func advanceSweep() {
-        guard sweepCursor < sweepCandidates.count else {
-            endSweepRun()
-            return
-        }
-        sweepValue = sweepCandidates[sweepCursor]
-        sweepCursor += 1
-        sweepAckSeen = false
-        guard let frame = NinebotFrame.writeBfgWord(register: NinebotFrame.capacityWriteIndex,
-                                                    value: sweepValue) else {
-            log(String(format: "SWEEP_RESULT v=%d 帧构造被拒，跳过", sweepValue))
-            advanceSweep()
-            return
-        }
-        log(String(format: "SWEEP_TRY v=%d（%d/%d）frame=%@",
-                   sweepValue, sweepCursor, sweepCandidates.count, Hex.encode(frame)))
-        status(String(format: "试探 %d mAh（%d/%d）…",
-                      sweepValue, sweepCursor, sweepCandidates.count))
-        state = .sweepTryWrite
-        send(frame)
-        result.writeCommandSent = true
-        scheduleVerify(after: 2.0) { [weak self] in self?.readBackSweepValue() }
-    }
-
-    private func readBackSweepValue() {
-        guard !finished, state == .sweepTryWrite || state == .sweepVerify else { return }
-        state = .sweepVerify
-        send(NinebotFrame.readBfgWord(register: NinebotFrame.capacityWriteIndex))
-        timeout(.sweepVerify, 3.0, String(format: "试探 %d 回读无回复", sweepValue))
-    }
-
-    /// Settles the candidate, then puts the original value back.
-    private func concludeSweepValue(_ after: Int) {
-        // A value that reads back is accepted even if the ACK was lost; a value
-        // that does not is refused even if an ACK arrived. The register is the
-        // evidence, the ACK only the first hint.
-        let accepted = after == sweepValue
-        if accepted { sweepAccepted.append(sweepValue) } else { sweepRefused.append(sweepValue) }
-        log(String(format: "SWEEP_RESULT v=%d ack=%@ after=%d → %@",
-                   sweepValue, sweepAckSeen ? "有" : "无", after,
-                   accepted ? "接受" : "拒绝"))
-        restoreSweepValue()
-    }
-
-    /// The revert. Everything above is allowed to be inconclusive; this is not.
-    private func restoreSweepValue() {
-        guard let frame = NinebotFrame.writeBfgWord(register: NinebotFrame.capacityWriteIndex,
-                                                    value: sweepOriginal) else {
-            fail("无法构造恢复帧；试探中止，0x0E 可能不是原值。")
-            return
-        }
-        log(String(format: "SWEEP_RESTORE %d → %d frame=%@",
-                   sweepValue, sweepOriginal, Hex.encode(frame)))
-        state = .sweepRestore
-        send(frame)
-        scheduleVerify(after: 2.0) { [weak self] in self?.verifySweepRestore() }
-    }
-
-    private func verifySweepRestore() {
-        guard !finished, state == .sweepRestore || state == .sweepRestoreVerify else { return }
-        state = .sweepRestoreVerify
-        send(NinebotFrame.readBfgWord(register: NinebotFrame.capacityWriteIndex))
-        timeout(.sweepRestoreVerify, 3.0, "恢复回读无回复")
-    }
-
-    private func concludeSweepRestore(_ restored: Int) {
-        guard restored == sweepOriginal else {
-            // Stop here. Continuing would walk the register further from where it
-            // started, which is the one outcome this mode must never produce.
-            log(String(format: "SWEEP_RESTORE_FAILED 期望 %d 实际 %d；中止试探",
-                       sweepOriginal, restored))
-            fail(String(format: "0x0E 未能恢复到原值 %d（当前 %d）。试探已中止，"
-                        + "请用「恢复 0x0E 到备份值」或重新连接核对。",
-                        sweepOriginal, restored))
-            return
-        }
-        log(String(format: "SWEEP_RESTORE_OK 0x0E=%d", restored))
-        advanceSweep()
-    }
-
-    private func endSweepRun() {
-        let ok = sweepAccepted.map(String.init).joined(separator: " ")
-        let no = sweepRefused.map(String.init).joined(separator: " ")
-        log("SWEEP_END 原值=\(sweepOriginal) 接受: \(ok.isEmpty ? "无" : ok) | 拒绝: \(no.isEmpty ? "无" : no)")
-        result.sweepAccepted = sweepAccepted
-        result.sweepRefused = sweepRefused
-        if sweepAccepted.isEmpty {
-            finish("试探完成：固件表内的候选值全部被拒绝。详见 SWEEP_ 日志。")
-        } else {
-            finish("试探完成：接受 \(ok)；拒绝 \(no.isEmpty ? "无" : no)。0x0E 已恢复为 \(sweepOriginal)。")
-        }
-    }
-
-    // MARK: - Dashboard full sweep implementation
-
-    private func beginDashboardScan() {
-        dashScanIndex = RegisterReadPlan.first
-        dashScanReplies = 0
-        dashScanTimeouts = 0
-        dashScanValues = [:]
-        // The meter holds 26000 in 0x0E, and the dashboard's own arithmetic works
-        // back to about that. If the dashboard keeps its own copy, one of its
-        // registers will carry this exact number.
-        dashScanReference = referenceCapacity
-        log("DISCAN_BEGIN 只读扫描仪表盘（模块 0x01）0x00–0xFF，一遍，不发送任何写入；"
-            + "参照容量=\(dashScanReference > 0 ? String(dashScanReference) : "未知")")
-        status("正在只读扫描仪表盘 0x00–0xFF（约 1–2 分钟）…")
-        requestDashboardScanRead()
-    }
-
-    private func requestDashboardScanRead() {
-        if dashScanIndex % 32 == 0 {
-            status("正在扫描仪表盘 \(dashScanIndex)/256…")
-        }
-        send(RegisterReadPlan.probeRequest(module: RegisterReadPlan.dashboard,
-                                           index: dashScanIndex))
-        timeout(.waitDashboardScan, 0.65, "仪表寄存器读取无回复")
-    }
-
-    private func advanceDashboardScan() {
-        dashScanIndex += 1
-        guard dashScanIndex <= RegisterReadPlan.last else {
-            endDashboardScan()
-            return
-        }
-        scheduleVerify(after: 0.05) { [weak self] in
-            guard let self, !self.finished, self.state == .waitDashboardScan else { return }
-            self.requestDashboardScanRead()
-        }
-    }
-
-    /// The whole point of the sweep is this summary: every register whose value
-    /// equals the capacity the meter holds. One of them is where the dashboard
-    /// keeps the configuration it enforces — and therefore the register any
-    /// future write would have to reach.
-    private func endDashboardScan() {
-        let answered = RegisterReadPlan.last - RegisterReadPlan.first + 1 - dashScanTimeouts
-        log(String(format: "DISCAN_END 扫描 256 个地址：有响应 %d，未回复 %d",
-                   dashScanReplies, dashScanTimeouts))
-        if dashScanReference > 0 {
-            let matches = dashScanValues.filter { $0.value == dashScanReference }
-                .keys.sorted().map { String(format: "0x%02X", $0) }.joined(separator: " ")
-            log("DISCAN_CAPACITY_MATCH 值等于 \(dashScanReference) 的地址："
-                + "\(matches.isEmpty ? "无" : matches)")
-        }
-        // Also surface round numbers in the plausible-capacity band: a rated
-        // capacity may be stored scaled (Wh, or 0.1 Ah) rather than in mAh.
-        let plausible = dashScanValues
-            .filter { CapacityCompatibilityResolver.isPlausible($0.value) }
-            .sorted { $0.key < $1.key }
-            .prefix(24)
-            .map { String(format: "0x%02X=%d", $0.key, $0.value) }
-            .joined(separator: " ")
-        log("DISCAN_PLAUSIBLE 落在合理容量区间的地址：\(plausible.isEmpty ? "无" : plausible)")
-        _ = answered
-        if dashScanReference > 0,
-           dashScanValues.contains(where: { $0.value == dashScanReference }) {
-            finish("仪表盘扫描完成：\(dashScanReplies) 个有响应；"
-                + "找到了值等于 \(dashScanReference) 的地址，详见 DISCAN_CAPACITY_MATCH。")
-        } else {
-            finish("仪表盘扫描完成：\(dashScanReplies) 个有响应，\(dashScanTimeouts) 个未回复。"
-                + "未找到等于参照容量的地址，详见 DISCAN_ 日志。")
-        }
-    }
-
-    // MARK: - Dashboard probe implementation
-
-    private func beginDashboardProbe() {
-        dashboardProbeCursor = 0
-        dashboardProbeReads = 0
-        dashboardProbeTimeouts = 0
-        let n = NinebotFrame.dashboardProbePlan.count
-        log("DISPROBE_BEGIN 只读诊断仪表盘（模块 0x01），\(n) 个寄存器，全部为读操作，不发送任何写入")
-        status("正在只读诊断仪表盘（\(n) 个寄存器）…")
-        advanceDashboardProbe()
-    }
-
-    private func advanceDashboardProbe() {
-        guard dashboardProbeCursor < NinebotFrame.dashboardProbePlan.count else {
-            log("DISPROBE_END 采集 \(dashboardProbeReads) 个，超时 \(dashboardProbeTimeouts) 个")
-            finish("仪表盘只读诊断完成：\(dashboardProbeReads) 个寄存器已记录，"
-                + "\(dashboardProbeTimeouts) 个未回复。详见 DISPROBE_ 日志。")
-            return
-        }
-        let entry = NinebotFrame.dashboardProbePlan[dashboardProbeCursor]
-        state = .dashboardProbe
-        send(NinebotFrame.readDashboardWord(index: entry.index))
-        timeout(.dashboardProbe, 3.5, String(format: "仪表 0x%02X 无回复", entry.index))
-    }
-
-    /// Records the value AND the raw frame. The raw bytes are the point: if a
-    /// parsing assumption is wrong later, the evidence to re-derive it is here.
-    private func recordDashboardProbe(plain: [UInt8]) -> Bool {
-        guard dashboardProbeCursor < NinebotFrame.dashboardProbePlan.count else { return false }
-        let entry = NinebotFrame.dashboardProbePlan[dashboardProbeCursor]
-        guard plain.count >= 9 else { return false }
-        let value = NinebotFrame.readLe16(plain, offset: 7)
-        dashboardProbeCursor += 1
-        dashboardProbeReads += 1
-        var note = ""
-        switch entry.index {
-        case 0x92:
-            let v = DisVoltageConfig.nominalVoltage(value)
-            let family = String(format: "0x%02X", value >> 4)
-            note = String(format: " → %@ / 高半字节 0x%X / 已知编码=%@",
-                          v > 0 ? "\(v)V" : "未识别", value >> 4,
-                          DisVoltageConfig.isObserved(value) ? "是" : "否")
-            _ = family
-        case 0x1A:
-            note = String(format: " → 仪表固件 %d.%d.%d",
-                          (value >> 8) & 0xF, (value >> 4) & 0xF, value & 0xF)
-        case 0xD1:
-            note = value == 0 ? " → 彩屏固件 0.0.0（无彩屏 = 一代）"
-                              : String(format: " → 彩屏固件 %d.%d.%d",
-                                       (value >> 8) & 0xF, (value >> 4) & 0xF, value & 0xF)
-        case 0x3D:
-            note = String(format: " → BFG 版本 %d.%d.%d",
-                          (value >> 8) & 0xF, (value >> 4) & 0xF, value & 0xF)
-        default:
-            break
-        }
-        log(String(format: "DISPROBE index=0x%02X value=0x%04X raw=%@%@",
-                   entry.index, value, Hex.encode(plain), note))
-        advanceDashboardProbe()
-        return true
-    }
+    // MARK: - Read-only post-write observation result
 
     private func endProfileWatch() {
         watchTimer?.cancel()
@@ -2342,18 +1510,6 @@ public final class BfgBleClient: NSObject {
                 fail("写入指令已发送，但连接中断，结果尚未确认；请重新连接读取当前配置。")
             }
             return true
-        case .writeCapacity:
-            // Without this the capacity path fell through to `default: false` and
-            // a post-write disconnect was reported as an ordinary failure — the
-            // one outcome that must never be silent, because the command may well
-            // have landed on the register the state-of-charge is computed from.
-            if result.capacityReadbackVerified {
-                finish("容量寄存器已回读确认；随后连接中断。断电保持仍需验证。")
-            } else {
-                fail("容量写入指令已发送，但连接中断，结果尚未确认；"
-                    + "请重新连接读取 0x0E 当前值。")
-            }
-            return true
         default:
             return false
         }
@@ -2368,7 +1524,7 @@ public final class BfgBleClient: NSObject {
     /// this was a latent race; under the simulator's faster turnaround it is
     /// routinely reachable.
     private func onQueue(_ work: @escaping @Sendable () -> Void) {
-        if DispatchQueue.getSpecific(key: BfgBleClient.queueKey) != nil {
+        if DispatchQueue.getSpecific(key: BfgBleClient.queueKey) == queueID {
             work()
         } else {
             queue.async(execute: work)
@@ -2451,7 +1607,7 @@ extension BfgBleClient: BleTransportDelegate {
     }
 
     private func handleConnect() {
-        guard !finished else { return }
+        guard !finished, state == .connecting else { return }
         clearTimeout()
         state = .discovering
         status("已连接；正在发现服务…")
@@ -2477,7 +1633,7 @@ extension BfgBleClient: BleTransportDelegate {
     }
 
     private func handleDiscoverServices(_ error: Error?) {
-        guard !finished else { return }
+        guard !finished, state == .discovering || state == .subscribing else { return }
         guard error == nil else {
             fail("发现服务失败：\(describe(error!))")
             return
@@ -2520,7 +1676,11 @@ extension BfgBleClient: BleTransportDelegate {
     }
 
     private func handleReceive(_ data: Data) {
-        handleNotify([UInt8](data))
+        guard !finished else { return }
+        for frame in receiveBuffer.accept(data) {
+            guard !finished else { break }
+            handleNotify(frame)
+        }
     }
 
     public func bleTransport(didReceive data: Data) {

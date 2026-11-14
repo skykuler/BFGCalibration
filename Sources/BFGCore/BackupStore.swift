@@ -223,7 +223,8 @@ public final class BackupStore {
         let suffixes = [Suffix.profile, Suffix.capacity, Suffix.time,
                         Suffix.prewriteProfile, Suffix.prewriteCapacity, Suffix.prewriteTime,
                         Suffix.prewriteDis92, Suffix.dis92Original,
-                        Suffix.lastConfirmedProfile, Suffix.lastConfirmedTime]
+                        Suffix.lastConfirmedProfile, Suffix.lastConfirmedTime,
+                        Suffix.ratedCapacity, Suffix.prewriteRatedCapacity]
         for suffix in suffixes {
             guard let key = key(serial, suffix) else { continue }
             defaults.removeObject(forKey: key)

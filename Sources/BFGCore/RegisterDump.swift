@@ -123,21 +123,19 @@ public struct RegisterDump: Codable, Equatable {
     /// Addresses whose value differs between two dumps. Entries present in only
     /// one dump are reported with `-1` on the missing side.
     public func changes(from other: RegisterDump) -> [Change] {
-        var result: [Change] = []
-        let keys = Set(entries.map { [$0.module, $0.index] })
-            .union(other.entries.map { [$0.module, $0.index] })
-        for key in keys {
-            let module = key[0], index = key[1]
-            let a = other.entry(module: module, index: index)
-            let b = entry(module: module, index: index)
-            let before = (a?.responded ?? false) ? a!.value : -1
-            let after = (b?.responded ?? false) ? b!.value : -1
-            if before != after {
-                result.append(Change(module: module, index: index,
-                                     before: before, after: after))
+        struct Address: Hashable { let module: Int; let index: Int }
+        func indexed(_ values: [Entry]) -> [Address: Int] {
+            var index: [Address: Int] = [:]
+            for entry in values {
+                index[Address(module: entry.module, index: entry.index)] = entry.responded ? entry.value : -1
             }
+            return index
         }
-        return result.sorted { ($0.module, $0.index) < ($1.module, $1.index) }
+        let before = indexed(other.entries), after = indexed(entries)
+        return Set(before.keys).union(after.keys).compactMap { key -> Change? in
+            let a = before[key] ?? -1, b = after[key] ?? -1
+            return a == b ? nil : Change(module: key.module, index: key.index, before: a, after: b)
+        }.sorted { ($0.module, $0.index) < ($1.module, $1.index) }
     }
 
     // MARK: - Adaptation
