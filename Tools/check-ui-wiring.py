@@ -69,8 +69,8 @@ def part1_contract_diff(html, swift):
     # an action the page *does* send and native never mentions at all.
     unhandled = sorted(a for a in sent_literally if a not in native_cases)
     if unhandled:
-        # `modal-state` / `screen` / `select-vehicle` are deliberate no-ops.
-        real = [a for a in unhandled if a not in {"modal-state", "screen", "select-vehicle"}]
+        # Only navigation acknowledgements may be deliberate no-ops.
+        real = [a for a in unhandled if a not in {"modal-state", "screen"}]
         if real:
             fail("页面发了但原生没有分支：" + ", ".join(real))
         else:
