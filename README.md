@@ -1,88 +1,44 @@
-# BFG电量校准 — iOS 移植
+# BFG 电量校准 iOS 2.2.0
 
-BFG电量校准的 iOS 版本。原工程是 Android 的第三方九号车辆电量校准工具。
+以开源安卓版 5.0.35 的主要蓝牙校准功能为基准的 iOS 移植。支持 iOS 16 及以上的 arm64 iPhone。项目没有完成该用户的 B30C / 磷酸铁锂配置实车验收。
 
-**完整设计说明见 [`docs/IOS_PORT.md`](docs/IOS_PORT.md)**，自签与安装见 [`docs/IOS_SIGNING.md`](docs/IOS_SIGNING.md)。
+## 功能范围
 
----
+- 扫描并明确选择车辆，车端按键确认配对；使用系统钥匙串保存凭据，恢复已配对车辆和当前选择。
+- 读取 SOC、容量、电压、固件版本与通信模式。
+- 原有计量模块 Profile 档位写入、受固件组合限制的仪表盘电压配置写入，以及写后回读。
+- 首次原参数、最近写前参数和仪表配置备份与恢复；写前快照保存并核实后才允许继续。
+- 原有只读寄存器扫描、诊断导出与分享。
 
-## 这个移植做了什么、没做什么
+本版本移除了独立 0x0E 容量写入、候选寄存器写探测、容量扫值、专家模式和 N 前缀只读豁免。N 开头车辆保留原版只读限制；仪表写入保留原版四项固件条件。
 
-原工程约 **60% 无法移植**——BlackBox 应用虚拟化、root 直读九号数据库、跨 App 读私有数据库，这些在 iOS 上不是「难」，是平台层面不存在实现路径。
+当前实现不包含 Android APK 虚拟运行、BlackBox 或读取其他应用的私有数据库。iPhone 越狱不会自动补齐这些代码；本应用的凭据来自自己的配对流程。
 
-**但核心价值 100% 保留**：BLE 配对、加密协议、寄存器读写、写入风控，以及整个界面。
+## 验证
 
-关键事实是**配对流程本身是自足的**（现场生成密钥 + 车端按键确认），九号数据库只是「跳过按键」的捷径。所以凭据获取那一半直接砍掉，改用系统钥匙串保存本 App 自己协商的密钥。
-
-| | Android | iOS |
-|---|---|---|
-| 凭据来源 | 读九号 App 数据库（root / 虚拟容器） | 本 App 自行配对协商 |
-| 凭据存储 | 仅进程内存，冷启动失效 | 系统钥匙串，跨启动有效 |
-| 需要 root | 是（或虚拟化容器） | 否 |
-| 界面 | WebView 加载 HTML | WKWebView 加载同一份 HTML（已做 iOS 适配，见 `docs/IOS_PORT.md` §8） |
-
----
-
-## 目录
-
-```
-Sources/BFGCore/         可移植核心（加密 / 协议 / 策略）
-Tests/BFGCoreTests/      100 个测试
-ios/BFGCalibration/      iOS 应用层（CoreBluetooth / WKWebView / Keychain）
-ios/project.yml          XcodeGen 工程定义
-.github/workflows/       macOS 构建流水线
-docs/                    设计与签名文档
-```
-
----
-
-## 验证状态
-
-| 层 | 状态 |
-|---|---|
-| 加密 / 协议 / 策略 | ✅ 100 个测试通过（AES 用 NIST 向量，SHA-1 用 RFC 3174 向量） |
-| 帧格式 | ✅ 字节级断言 |
-| iOS 应用层 | ✅ **类型检查通过**（`Tools/typecheck-ios.sh`）；行为验证在 CI 的 macOS runner |
-| 页面 ⇄ 原生契约 | ✅ **通过**（`Tools/check-ui-wiring.py`）：动作接线 + 无头浏览器交互断言 |
-| 真机 BLE | ❌ 未验证，需真车 + 真机 |
-
-### 在 Linux 上做 iOS 类型检查
-
-CoreBluetooth / WebKit / UIKit / SwiftUI / Security 在开源 Swift 工具链里不存在，所以本机无法编译 iOS 层。`Tools/AppleStubs/` 声明了用到的 Apple API 子集，让 iOS 源码能在 Linux 上**真正编译并类型检查**——这比 `swiftc -parse` 的语法解析强得多。
-
-它已经抓出两个真实缺陷：`BfgBleClient` 缺 `import Security`、`PrototypeWebView` 缺 `import Foundation`（两者在 macOS 上同样会编译失败）。
-
-```bash
-Tools/typecheck-ios.sh
-```
-
-**局限**：桩的签名若与 Apple 实际不符会产生假通过，且不验证行为。**CI 的 macOS runner 仍是权威。**
-
-### 在 Linux 上运行测试
-
-```bash
-# 需要 Swift 6.0 工具链
-export PATH=/opt/swift/usr/bin:$PATH
-export LD_LIBRARY_PATH=/opt/swift/usr/lib/swift/linux:$LD_LIBRARY_PATH
+```sh
+npm ci --ignore-scripts
+npm test
 swift test
+python3 Tools/run-transport-regression.py
+swift run bfgdemo
 ```
 
-### 构建 iOS 应用
+CI 还检查页面动作契约，并在 macOS 上生成 Xcode 工程、编译 iOS Release 和检查产物权限声明。蓝牙适配器回归执行的是生产适配器源码与模拟 CoreBluetooth，不代表实际无线链路或真机 CPU / 内存测试。
 
-macOS 上：
+精确测试结果以相应提交的 Actions 记录为准。安装后仍需先验证扫描、目标车辆身份、配对、重连和只读数据；实车写入与恢复要单独验收。编译或模拟测试成功不能证明具体车辆可校准，也不会自动生成磷酸铁锂专用 SOC 曲线。
 
-```bash
+## 构建和安装
+
+```sh
 brew install xcodegen
 xcodegen generate --spec ios/project.yml
-open ios/BFGCalibration.xcodeproj
 ```
 
-或直接推到 GitHub，让 `.github/workflows/ios.yml` 在 macOS runner 上构建。
+`.github/workflows/ios.yml` 生成未签名 IPA。普通安装需要签名；已安装 TrollStore 且受支持的系统可以由 TrollStore 处理安装。不要向项目或聊天提交 Apple ID 密码、访问令牌或签名私钥。
 
----
+架构和修复说明见 [docs/IOS_PORT.md](docs/IOS_PORT.md)，测试边界见 [docs/TESTING.md](docs/TESTING.md)，证书构建说明见 [docs/IOS_SIGNING.md](docs/IOS_SIGNING.md)。
 
 ## 许可证
 
-根目录 `LICENSE` 使用 Apache License 2.0。
-
-原 Android 工程内含 BlackBox 等上游模块，各自版权与许可证需按其目录保留——**本移植已删除全部 BlackBox 相关代码**，因此不再继承其许可约束。
+Apache License 2.0，详见 LICENSE。保留原项目及上游版权声明。

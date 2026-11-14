@@ -2,8 +2,11 @@
 import Foundation
 
 open class CBUUID: NSObject {
-    public init(string: String) {}
-    public init(data: Data) {}
+    public let uuidString: String
+    public init(string: String) { uuidString = string.uppercased(); super.init() }
+    public init(data: Data) { uuidString = data.map { String(format: "%02X", $0) }.joined(); super.init() }
+    open override func isEqual(_ object: Any?) -> Bool { (object as? CBUUID)?.uuidString == uuidString }
+    open override var hash: Int { uuidString.hashValue }
 }
 
 open class CBPeer: NSObject {}
@@ -64,7 +67,17 @@ open class CBPeripheral: CBPeer {
 open class CBCentralManager: NSObject {
     open var state: CBManagerState = .unknown
 
-    public init(delegate: CBCentralManagerDelegate?, queue: DispatchQueue?) {}
+    public static var lastCreated: CBCentralManager?
+    public weak var delegate: CBCentralManagerDelegate?
+    private let callbackQueue: DispatchQueue
+    public init(delegate: CBCentralManagerDelegate?, queue: DispatchQueue?) {
+        self.delegate = delegate
+        callbackQueue = queue ?? DispatchQueue(label: "stub-central")
+        super.init()
+        Self.lastCreated = self
+    }
+    public func performAndWait(_ body: () -> Void) { callbackQueue.sync(execute: body) }
+    open func retrieveConnectedPeripherals(withServices services: [CBUUID]) -> [CBPeripheral] { [] }
     open func scanForPeripherals(withServices serviceUUIDs: [CBUUID]?,
                                  options: [String: Any]?) {}
     open func stopScan() {}
@@ -94,6 +107,7 @@ public protocol CBPeripheralDelegate: AnyObject {
                     error: Error?)
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?)
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral)
 }
 
 public let CBAdvertisementDataLocalNameKey = "kCBAdvDataLocalName"

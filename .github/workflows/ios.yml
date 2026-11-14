@@ -27,16 +27,47 @@ jobs:
       - name: Show toolchain
         run: swift --version
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install UI test dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run page interaction regressions
+        run: npm test
+
+      - name: Check page and native action contracts
+        run: |
+          python3 - <<'PY'
+          import pathlib, runpy
+          checks = runpy.run_path('Tools/check-ui-wiring.py')
+          checks['part1_contract_diff'](
+              pathlib.Path('ios/BFGCalibration/Resources/bfg-calibration-flow.html').read_text(),
+              pathlib.Path('ios/BFGCalibration/PrototypeWebView.swift').read_text())
+          assert not checks['failures'], checks['failures']
+          PY
+
       # Same suite that passes on Linux, re-run here to catch any
       # platform-specific divergence in Foundation or XCTest.
       - name: Run BFGCore tests
         run: swift test
+
+      - name: Run production BLE adapter regression with a stub radio
+        run: python3 Tools/run-transport-regression.py
 
       # Drives the real client state machine against the simulated vehicle:
       # pairing, the full read chain, and write-then-read-back including the
       # degraded cases (lost ACK, lazily persisted value, silent registers).
       - name: Run simulated-vehicle end-to-end demo
         run: swift run bfgdemo
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-results
+          path: build/ui-test-results.json
+          if-no-files-found: ignore
 
   build-ios:
     name: Build iOS app

@@ -58,6 +58,7 @@ public final class VirtualVehicle {
         public var writeAppliesAfterReads = 0
         /// Registers that never answer, as `(dst, index)`.
         public var silentRegisters: Set<Register> = []
+        public var silentFirstRead: Set<Register> = []
         /// Refuse `SET_PWD` (reply status other than 0/1).
         public var rejectPairing = false
         /// Emit `SET_PWD` status 0 ("press the button") this many times first.
@@ -249,7 +250,10 @@ public final class VirtualVehicle {
 
         case 0x01:
             let index = Int(plain[6])
-            guard !config.silentRegisters.contains(Register(dst, index)) else { return [] }
+            let address = Register(dst, index)
+            let first = registersRead.insert(address).inserted
+            guard !config.silentRegisters.contains(address),
+                  !(first && config.silentFirstRead.contains(address)) else { return [] }
             guard let data = readValue(dst: dst, index: index) else { return [] }
             return [encode([0x5A, 0xA5, UInt8(data.count), UInt8(dst), 0x3E, 0x04, UInt8(index)] + data)]
 
@@ -291,6 +295,8 @@ public final class VirtualVehicle {
     }
 
     // MARK: - Reads
+
+    private var registersRead = Set<Register>()
 
     private func readValue(dst: Int, index: Int) -> [UInt8]? {
         // A lazily-persisting vehicle reveals the staged value only after the

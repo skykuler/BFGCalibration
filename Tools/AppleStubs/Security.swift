@@ -27,3 +27,8 @@ public func SecItemAdd(_ attributes: CFDictionary,
 public func SecItemCopyMatching(_ query: CFDictionary,
                                 _ result: UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus { 0 }
 public func SecItemDelete(_ query: CFDictionary) -> OSStatus { 0 }
+
+public let errSecItemNotFound: OSStatus = -25300
+public let kSecReturnAttributes = "kSecReturnAttributes"
+public let kSecMatchLimitAll = "kSecMatchLimitAll"
+public func SecItemUpdate(_ query: CFDictionary, _ attributesToUpdate: CFDictionary) -> OSStatus { 0 }

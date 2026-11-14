@@ -61,110 +61,21 @@ public enum NinebotFrame {
         [0x5A, 0xA5, 0x01, 0x3E, 0x10, 0x02, 0x00, UInt8(profile & 0xFF)]
     }
 
-    /// Writes the rated-capacity word at `0x0E`.
-    ///
-    /// This is the second — and only other — write site in the whole app.
-    ///
-    /// It exists because the vehicle itself forces it. The profile byte declares
-    /// a capacity, the capacity registers hold one, and a vehicle that finds the
-    /// two disagreeing silently restores the declaration a few seconds later.
-    /// Measured on the real M85C: profile 0xD0 was accepted (WRITE_ACK), applied
-    /// after 2.16 s, held for 6.57 s, then reverted to 0x50 — which is exactly
-    /// the byte that agrees with the 26000 mAh still sitting in 0x0E. Writing
-    /// only the declaration can therefore never survive.
-    ///
-    /// Two properties keep this narrow:
-    ///   - the address is a literal here, never a parameter, so no caller can
-    ///     aim this builder at another register;
-    ///   - the value is a 16-bit little-endian word, matching `readLe16` and the
-    ///     `readCapacity` frame the tool already trusts.
-    public static func writeCapacityRated(_ milliAh: Int) -> [UInt8] {
-        let clamped = max(0, min(0xFFFF, milliAh))
-        return [0x5A, 0xA5, 0x02, 0x3E, 0x10, 0x02, 0x0E,
-                UInt8(clamped & 0xFF), UInt8((clamped >> 8) & 0xFF)]
-    }
-
-    /// Writes a 16-bit word to a probe register, or nothing if the address is not
-    /// on the allowlist.
-    ///
-    /// Unlike `writeCapacityRated`, this one takes an address — the whole point is
-    /// to ask which of the capacity candidates accept a write. That makes the
-    /// allowlist check load-bearing: it happens here, in the builder, so a probe
-    /// run can never become a general-purpose register writer by passing a
-    /// different index.
-    ///
-    /// Returns nil rather than trapping so the caller has to handle a refusal.
-    public static func writeBfgWord(register: Int, value: Int) -> [UInt8]? {
-        guard WriteAccessPolicy.probeRegisterAllowlist.contains(register) else { return nil }
-        let clamped = max(0, min(0xFFFF, value))
-        return [0x5A, 0xA5, 0x02, 0x3E, 0x10, 0x02,
-                UInt8(register & 0xFF),
-                UInt8(clamped & 0xFF), UInt8((clamped >> 8) & 0xFF)]
-    }
-
-    // MARK: - Dashboard (DIS) read-only probe
-
-    /// A read of one 16-bit word from the dashboard module.
-    ///
-    /// Read-only by construction, and deliberately not gated by any switch: this
-    /// file produces no dashboard write frame at all. The one that exists lives in
-    /// `DisVoltageConfig.writePacket` and is gated by `DashboardWritePolicy`, which
-    /// this probe never touches.
-    public static func readDashboardWord(index: Int) -> [UInt8] {
-        [0x5A, 0xA5, 0x01, 0x3E, 0x01, 0x01, UInt8(index & 0xFF), 0x02]
-    }
-
-    /// What a dashboard probe reads, and why each one is on the list.
-    ///
-    /// The value that matters is 0x92 — the dashboard's own voltage selector, and
-    /// therefore the configuration it holds authority over. The rest are here to
-    /// answer a narrower question: whether this is a colour-display unit at all.
-    /// On the M85C that prompted this, `colorDisplay` reads 0.0.0 and the
-    /// dashboard allowlist demands 1.5.5, which is why dashboard writes were never
-    /// available on that vehicle.
-    public static let dashboardProbePlan: [(index: Int, label: String)] = [
-        (0x92, "电压配置"),
-        (0x1A, "仪表固件"),
-        (0xD1, "彩屏固件"),
-        (0xB5, "仪表 SOC"),
-        (0xB1, "VRLA 电压"),
-        (0x3D, "BFG 版本"),
-        (0x1E, "能量 Wh"),
-        (0x44, "剩余容量"),
-    ]
-
-    /// The register `writeCapacityRated` targets. Exposed so callers can log and
-    /// verify against the same constant instead of repeating the literal.
-    public static let capacityWriteIndex = 0x0E
-
+    /// Two-byte read used by the original capacity compatibility chain.
     public static func readBfgWord(register: Int) -> [UInt8] {
         [0x5A, 0xA5, 0x01, 0x3E, 0x10, 0x01, UInt8(register & 0xFF), 0x02]
     }
 
     public static func authenticate(serial14: [UInt8]) throws -> [UInt8] {
         guard serial14.count == 14 else { throw Failure.serialMustBe14Bytes }
-        var out = authenticateHeader
-        out.append(contentsOf: serial14)
-        return out
+        return authenticateHeader + serial14
     }
-
-    /// Builds the `SET_PWD` request that hands the vehicle a freshly generated
-    /// 32-byte pairing password.
-    public static func setPassword(password32: [UInt8]) -> [UInt8] {
-        var out = setPasswordHeader
-        out.append(contentsOf: password32)
-        return out
-    }
-
-    // MARK: - Parsing
-
+    public static func setPassword(password32: [UInt8]) -> [UInt8] { setPasswordHeader + password32 }
     public static func isFrame(_ plain: [UInt8]?, src: Int, dst: Int, cmd: Int) -> Bool {
         guard let plain, plain.count >= 7 else { return false }
-        return plain[0] == 0x5A && plain[1] == 0xA5
-            && Int(plain[3]) == src && Int(plain[4]) == dst && Int(plain[5]) == cmd
+        return plain[0] == 0x5A && plain[1] == 0xA5 && Int(plain[3]) == src
+            && Int(plain[4]) == dst && Int(plain[5]) == cmd
     }
-
-    /// Little-endian 16-bit read, matching the dashboard's `LE16` encoding.
     public static func readLe16(_ plain: [UInt8], offset: Int) -> Int {
         Int(plain[offset]) | (Int(plain[offset + 1]) << 8)
     }

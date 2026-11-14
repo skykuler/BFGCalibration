@@ -20,16 +20,21 @@ public final class VirtualLink: BleTransport {
     private let vehicle: VirtualVehicle
     private let queue = DispatchQueue(label: "com.bfgtools.simulator.link")
     private let latency: TimeInterval
+    private let notificationChunkSize: Int?
+    private let corruptPairConfirmation: Bool
     private var connected = false
 
     /// - Parameter latency: round-trip delay applied to every exchange. Small
     ///   enough to keep tests quick, large enough that a reply never lands
     ///   inside the write call itself.
     public init(vehicle: VirtualVehicle, poweredOn: Bool = true,
-                latency: TimeInterval = 0.003) {
+                latency: TimeInterval = 0.003, notificationChunkSize: Int? = nil,
+                corruptPairConfirmation: Bool = false) {
         self.vehicle = vehicle
         self.isPoweredOn = poweredOn
         self.latency = latency
+        self.notificationChunkSize = notificationChunkSize
+        self.corruptPairConfirmation = corruptPairConfirmation
     }
 
     // MARK: - BleTransport
@@ -77,8 +82,18 @@ public final class VirtualLink: BleTransport {
         writes.append(line)
         queue.asyncAfter(deadline: .now() + latency) { [weak self] in
             guard let self, self.connected else { return }
-            for reply in self.vehicle.receive(line) {
-                self.delegate?.bleTransport(didReceive: Data(reply))
+            for response in self.vehicle.receive(line) {
+                var reply = response
+                if self.corruptPairConfirmation, line.count > 2, line[2] == 32, reply.count >= 13 {
+                    reply[reply.count - 6] ^= 1
+                }
+                let size = max(1, self.notificationChunkSize ?? reply.count)
+                var offset = 0
+                while offset < reply.count {
+                    let end = min(offset + size, reply.count)
+                    self.delegate?.bleTransport(didReceive: Data(reply[offset..<end]))
+                    offset = end
+                }
             }
             self.delegate?.bleTransport(didWrite: nil)
             if self.vehicle.wantsDisconnect {

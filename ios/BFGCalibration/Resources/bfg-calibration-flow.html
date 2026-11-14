@@ -524,7 +524,7 @@ globalThis.lucide = {createIcons() {
     writeType: initial.writeType === 'dashboard' ? 'dashboard' : 'meter',
     voltage: [48, 60, 72].includes(Number(initial.voltage)) ? Number(initial.voltage) : 60,
     capacity: Number(initial.capacity) || 26,
-    vehicleSn: '', vehicleModel: '', vehicles: [], connected: false,
+    vehicleSn: '', vehicleModel: '', vehicles: [], connected: false, credentialAvailable: false,
     soc: '--', batteryVoltage: '--', remainingCapacity: '--',
     dashboardVoltage: '--', dashboardCapacity: '--',
     meterVoltage: '--', meterCapacity: '--', dashboardFirmware: '--',
@@ -606,8 +606,8 @@ globalThis.lucide = {createIcons() {
         <section class="nb-card nb-section">
           <div class="nb-vehicle-card" style="padding:0;border:0;background:transparent">
             <div class="nb-vehicle-icon">${icon('key-round')}</div>
-            <div class="nb-grow"><div class="nb-label">车辆凭据</div><div class="nb-value">${state.vehicleSn ? '已保存到系统钥匙串' : '尚未配对'}</div><div class="nb-label">${state.vehicleSn ? '可直接连接，无需在车上再次确认' : '配对一次后即可免按键重连'}</div></div>
-            <span class="nb-badge">${icon(state.vehicleSn ? 'circle-check' : 'key-round')}${state.vehicleSn ? '已配对' : '未配对'}</span>
+            <div class="nb-grow"><div class="nb-label">车辆凭据</div><div class="nb-value">${state.credentialAvailable ? '已保存到系统钥匙串' : '尚未配对'}</div><div class="nb-label">${state.credentialAvailable ? '可直接连接，无需在车上再次确认' : '配对一次后即可免按键重连'}</div></div>
+            <span class="nb-badge">${icon(state.credentialAvailable ? 'circle-check' : 'key-round')}${state.credentialAvailable ? '已配对' : '未配对'}</span>
           </div>
         </section>
         <section class="nb-section">
@@ -681,39 +681,6 @@ globalThis.lucide = {createIcons() {
           ${state.backupAlternativesDiffer ? `<button class="nb-secondary" style="margin-top:10px" type="button" data-action="restore-prewrite" ${!state.recentBackupValid || state.readOnlyVehicle ? 'disabled' : ''}>恢复最近写入前参数</button>` : ''}
           <div class="nb-label" style="margin-top:12px">首次仪表配置</div><div class="nb-value" style="overflow-wrap:anywhere">${esc(state.disBackup || '未保存')}</div>
           <button class="nb-secondary" style="margin-top:10px" type="button" data-action="restore-dis" ${!state.disBackupValid || state.readOnlyVehicle ? 'disabled' : ''}>恢复首次仪表配置</button>
-        </section>
-        <section class="nb-card nb-section">
-          <div class="nb-section-head"><h3 class="nb-section-title">未验证车型测试</h3></div>
-          <p class="nb-label">原版对没有验证过的车型直接拒绝写入——比如 N 开头、3U 开头的序列号，或没通过通信验证的仪表与计量组合。打开后这些限制会放开，但写前整片快照、写后回读比对、恢复入口全部照常执行。</p>
-          <button class="nb-secondary" style="margin-top:12px" type="button" data-action="expert-mode">${state.expertMode ? '关闭专家模式' : '开启专家模式（自担风险）'}</button>
-          ${state.expertMode ? `<div class="nb-alert warning" style="margin-top:12px">${icon('triangle-alert')}<span>专家模式已开启。仅本次运行有效，重启应用后自动关闭。</span></div>` : ''}
-        </section>
-        <section class="nb-card nb-section">
-          <div class="nb-section-head"><h3 class="nb-section-title">仪表盘只读诊断</h3></div>
-          <p class="nb-label">读取仪表盘自己的寄存器。其中 <b>0x92</b> 是仪表的电压配置——<b>它才是那台车反复覆盖计量模块的原因</b>。日志里每个寄存器都会留下原始帧和解析结果。</p>
-          <p class="nb-label">这一步<b>只读</b>，不需要开启任何开关，也不会发送任何写入指令。</p>
-          ${state.disConfigRaw ? `<div class="nb-label" style="margin-top:12px">最近读到的 0x92</div><div class="nb-value">${esc(state.disConfigRaw)}${state.disConfigVoltage ? ' · ' + esc(state.disConfigVoltage) : ''}</div>` : ''}
-          <button class="nb-secondary" style="margin-top:12px" type="button" data-action="dashboard-probe">读取仪表盘寄存器</button>
-          <button class="nb-secondary" style="margin-top:10px" type="button" data-action="dashboard-scan">扫描仪表盘全部寄存器（只读）</button>
-        </section>
-
-        <section class="nb-card nb-section">
-          <div class="nb-section-head"><h3 class="nb-section-title">额定容量寄存器 0x0E</h3></div>
-          <p class="nb-label">计量模块算电量用的额定容量就存在这里。实测发现：只写档位（0x00）会在约 6.5 秒后被车辆改回，因为它与这里的值不自洽——所以要让改动站住，得连这个寄存器一起写。</p>
-          <p class="nb-label">写入前会先读原值做备份，读不到就一个字节都不发；写后保持连接观察 90 秒，并在日志里记录 0x0E / 0x0F / 档位三个寄存器的变化。</p>
-          <p class="nb-label"><b>实车结论已更新</b>：0x0E <b>可以写</b>——写回它自己的当前值会立刻收到 ACK；但写 55000 会被完全忽略。所以它不是只读，而是有一个「接受范围」。下面两个工具分别回答「哪些寄存器能写」和「容量能写到多大」。</p>
-          <div class="nb-label" style="margin-top:12px">已备份的 0x0E 原值</div>
-          <div class="nb-value">${state.ratedCapacityBackup ? esc(state.ratedCapacityBackup) : '未建立'}</div>
-          <button class="nb-secondary" style="margin-top:12px" type="button" data-action="sweep-enable">${state.sweepEnabled ? '关闭容量值试探' : '开启容量值试探'}</button>
-          <button class="nb-secondary" style="margin-top:10px" type="button" data-action="sweep-values">容量值试探（找出接受上界）</button>
-          ${state.sweepEnabled ? `<div class="nb-alert warning" style="margin-top:12px">${icon('triangle-alert')}<span>试探已开启：会逐个写入固件表里的容量值并立刻写回原值；任何一步恢复失败会立即中止。</span></div>` : ''}
-          <button class="nb-secondary" style="margin-top:12px" type="button" data-action="probe-enable">${state.probeEnabled ? '关闭寄存器写入探测' : '开启寄存器写入探测'}</button>
-          <button class="nb-secondary" style="margin-top:10px" type="button" data-action="probe-registers">探测容量候选寄存器</button>
-          ${state.probeEnabled ? `<div class="nb-alert warning" style="margin-top:12px">${icon('triangle-alert')}<span>探测已开启：会向白名单里的寄存器各写一次它自己的当前值，车辆参数不变。</span></div>` : ''}
-          <button class="nb-secondary" style="margin-top:12px" type="button" data-action="capacity-enable">${state.capacityWriteEnabled ? '关闭容量寄存器写入' : '开启容量寄存器写入（独立开关）'}</button>
-          <button class="nb-secondary" style="margin-top:10px" type="button" data-action="capacity-write">写入额定容量</button>
-          <button class="nb-secondary" style="margin-top:10px" type="button" data-action="capacity-restore">恢复 0x0E 到备份值</button>
-          ${state.capacityWriteEnabled ? `<div class="nb-alert warning" style="margin-top:12px">${icon('triangle-alert')}<span>容量寄存器写入已开启。仅本次运行有效，重启应用后自动关闭。</span></div>` : ''}
         </section>
         <section class="nb-section"><div class="nb-section-head"><h3 class="nb-section-title">维护与说明</h3></div>
           <div class="nb-list"><button class="nb-list-item" type="button" data-action="export-diag"><div class="nb-grow"><div class="nb-value">导出最近一次诊断</div><div class="nb-label">仅在需要排查连接问题时使用</div></div>${icon('chevron-right')}</button>
@@ -865,8 +832,7 @@ globalThis.lucide = {createIcons() {
     // The read-only-serial rule is a default the owner can waive, so it must not
     // disable the button — the tap is what opens the waiver. Every other blocker
     // still disables it, and the native side re-checks before any frame is sent.
-    const serialWaivable = !!state.readOnlyVehicle && !isDash;
-    const writeBlocked = isDash ? !state.dashboardWriteSupported : (!state.writeSupported && !serialWaivable);
+    const writeBlocked = state.readOnlyVehicle || (isDash ? !state.dashboardWriteSupported : !state.writeSupported);
     const blockedReason = state.readOnlyVehicle
       ? '此车序列号以 N 开头，原版规则仅允许读取。点「核对并写入」会让你确认后放开本次写入。'
       : isDash
@@ -983,15 +949,17 @@ globalThis.lucide = {createIcons() {
   let gateTimer = null;
   let gateNonceSeen = null;
   let gateDeadline = 0;
+  let gateChecked = false;
 
   /// Re-armed after every render. The deadline is anchored to the gate's nonce so
   /// an unrelated repaint cannot restart the wait.
   function startGateTimer() {
     if (gateTimer) { clearInterval(gateTimer); gateTimer = null; }
     const gate = state.writeGate;
-    if (!gate || state.modal !== 'write-gate') { gateNonceSeen = null; return; }
+    if (!gate || state.modal !== 'write-gate') { gateNonceSeen = null; gateChecked = false; return; }
     if (gateNonceSeen !== gate.nonce) {
       gateNonceSeen = gate.nonce;
+      gateChecked = false;
       gateDeadline = Date.now() + (Number(gate.seconds) || 0) * 1000;
     }
     const button = document.getElementById('write-gate-confirm');
@@ -1003,7 +971,7 @@ globalThis.lucide = {createIcons() {
       button.disabled = !(left === 0 && !!(box && box.checked));
       button.textContent = left > 0 ? `${label}（${left}秒）` : label;
     };
-    if (box) box.onchange = sync;
+    if (box) { box.checked = gateChecked; box.onchange = () => { gateChecked = box.checked; sync(); }; }
     sync();
     gateTimer = setInterval(() => {
       sync();
@@ -1034,9 +1002,7 @@ globalThis.lucide = {createIcons() {
       'clear-data-confirm': ['triangle-alert', '清除本机数据？', '将删除本机保存的配对凭据与参数备份。清除后需要重新配对才能使用，且无法找回备份。', '确认清除', 'clear-data-confirmed', '取消', 'close-modal'],
       'scan-unavailable': ['triangle-alert', '扫描未完成', state.errorMessage || '请检查车辆连接后再试。', '我知道了', 'close-modal', '', ''],
       'read-advisory': ['triangle-alert', '读取结果仅供参考', state.errorMessage || '请核对车辆实际配置。', '我知道了', 'close-modal', '', ''],
-      'unverified-dis': ['triangle-alert', '仪表配置尚未验证', state.errorMessage || '这组仪表配置尚无实车验证，请确认可以恢复原参数后继续。', '仍要尝试写入', 'confirm-unverified-dis', '取消', 'close-modal'],
-      'offtable-write': ['triangle-alert', '本车型的容量映射与静态表不同', state.errorMessage || '照表写入得不到你选的容量。', '我已知晓，仍要写入', 'confirm-offtable-write', '取消', 'close-modal'],
-      'nserial-write': ['triangle-alert', '该车辆序列号以 N 开头', state.errorMessage || '原版工具把 N 开头的序列号一律视为只读。只有在你确认这是本人的车辆后才应继续。', '我确认，放开本次写入', 'confirm-nserial-write', '取消', 'close-modal']
+      'unverified-dis': ['triangle-alert', '仪表配置尚未验证', state.errorMessage || '这组仪表配置尚无实车验证，请确认可以恢复原参数后继续。', '仍要尝试写入', 'confirm-unverified-dis', '取消', 'close-modal']
     };
     const item = specs[kind];
     if (!item) return '';
@@ -1131,10 +1097,10 @@ globalThis.lucide = {createIcons() {
     const actionEl = event.target.closest('[data-action]');
     if (!actionEl) return;
     const action = actionEl.dataset.action;
-    if (action === 'home') { if (window.BfgNative) nativeAction('cancel'); state.result = null; go('home'); }
-    else if (action === 'back') { if (state.screen === 'post-write-check') return; if (window.BfgNative && state.screen.endsWith('progress')) nativeAction('cancel'); go(state.screen === 'scan-result' || state.screen === 'scan-progress' ? 'settings' : (state.screen === 'write' || state.screen === 'write-progress') ? 'review' : 'home'); }
+    if (action === 'home') { if (window.BfgNative) nativeAction('cancel', 'home'); state.result = null; go('home'); }
+    else if (action === 'back') { if (state.screen === 'post-write-check') return; if (window.BfgNative && state.screen.endsWith('progress')) nativeAction('cancel', state.screen === 'scan-progress' ? 'settings' : state.screen === 'write-progress' ? 'review' : 'home'); go(state.screen === 'scan-result' || state.screen === 'scan-progress' ? 'settings' : (state.screen === 'write' || state.screen === 'write-progress') ? 'review' : 'home'); }
     else if (action === 'vehicles' || action === 'settings') { go(action); }
-    else if (action === 'select-vehicle') { state.selectedVehicleIndex = Number(actionEl.dataset.index); if (window.BfgNative) nativeAction('select-vehicle', String(state.selectedVehicleIndex)); go('home'); }
+    else if (action === 'select-vehicle') { state.selectedVehicleIndex = Number(actionEl.dataset.index); const vehicle = state.vehicles[state.selectedVehicleIndex]; if (!vehicle) return; state.vehicleSn = vehicle.sn; state.credentialAvailable = vehicle.paired === true; state.connected = false; if (window.BfgNative) nativeAction('select-vehicle', String(state.selectedVehicleIndex)); go('home'); }
     else if (action === 'refresh-vehicles') { if (window.BfgNative) nativeAction('refresh-vehicles'); }
     else if (action === 'clear-data') { state.modal = 'clear-data-confirm'; render(); save(); }
     else if (action === 'clear-data-confirmed') { state.modal = null; render(); save(); if (window.BfgNative) nativeAction('clear-data'); }
@@ -1151,13 +1117,13 @@ globalThis.lucide = {createIcons() {
       if (window.BfgNative) nativeAction(action);
     }
     else if (action === 'scan-dis' || action === 'scan-bfg') { state.scanModule = action === 'scan-dis' ? '仪表盘' : '计量模块'; state.errorMessage = ''; state.scanReplies = 0; state.scanTimeouts = 0; go('scan-progress'); if (window.BfgNative) nativeAction(action); }
-    else if (action === 'cancel-scan') { if (window.BfgNative) nativeAction('cancel'); go('settings'); }
+    else if (action === 'cancel-scan') { if (window.BfgNative) nativeAction('cancel', 'settings'); go('settings'); }
     else if (action === 'show-dashboard-requirements') { state.modal = 'dashboard-requirements'; render(); }
     else if (action === 'pair-list') { go('pair-list'); if (window.BfgNative) nativeAction('pair-scan'); }
     else if (action === 'pair-select') { const index = Number(actionEl.dataset.index); state.selectedPairIndex = index; const vehicle = state.vehicles[index]; if (vehicle) state.vehicleSn = vehicle.sn; if (window.BfgNative) nativeAction('pair-select', String(index)); showWake('pair'); }
-    else if (action === 'connect-start') { if (window.BfgNative && !state.vehicleSn) { state.modal = 'missing-vehicle'; render(); } else showWake('connect'); }
+    else if (action === 'connect-start') { if (window.BfgNative && (!state.vehicleSn || !state.credentialAvailable)) { state.modal = 'missing-vehicle'; render(); } else showWake('connect'); }
     else if (action === 'wake-confirm') go(state.path === 'pair' ? 'pair-ready' : 'connect-ready');
-    else if (action === 'close-modal') { state.modal = null; render(); save(); }
+    else if (action === 'close-modal') { const completed = state.modal === 'write-success'; state.modal = null; if (completed) go('review'); else { render(); save(); } }
     else if (action === 'open-bluetooth-settings') { state.modal = null; render(); if (window.BfgNative) nativeAction('open-bluetooth-settings'); }
     else if (action === 'retry-connect') { state.modal = null; completeConnection(false); }
     else if (action === 'start-repair') { state.modal = null; render(); if (window.BfgNative) nativeAction('start-repair'); else go('pair-list'); }
@@ -1169,15 +1135,13 @@ globalThis.lucide = {createIcons() {
     }
     else if (action === 'post-write-reread') { state.modal = null; go('post-write-check'); if (window.BfgNative) nativeAction('post-write-reread'); }
     else if (action === 'confirm-unverified-dis') { state.modal = null; state.writeStage = 'precheck'; go('write-progress'); if (window.BfgNative) nativeAction('confirm-unverified-dis'); }
-    else if (action === 'confirm-nserial-write') { state.modal = null; state.writeStage = 'precheck'; go('write-progress'); if (window.BfgNative) nativeAction('confirm-nserial-write'); }
-    else if (action === 'confirm-offtable-write') { state.modal = null; state.writeStage = 'precheck'; go('write-progress'); if (window.BfgNative) nativeAction('confirm-offtable-write'); }
     else if (action === 'write-gate-confirm') {
       const box = document.getElementById('write-gate-check');
       const confirmButton = document.getElementById('write-gate-confirm');
       if (confirmButton && confirmButton.disabled) return;
       if (window.BfgNative) nativeAction('write-gate-confirm', JSON.stringify({ nonce: state.writeGate ? state.writeGate.nonce : -1, checked: !!(box && box.checked) }));
     }
-    else if (action === 'write-gate-cancel') { state.writeGate = null; state.modal = null; render(); save(); if (window.BfgNative) nativeAction('write-gate-cancel'); }
+    else if (action === 'write-gate-cancel') { state.writeGate = null; state.modal = null; go('review'); if (window.BfgNative) nativeAction('write-gate-cancel'); }
     else if (action === 'begin-pair') completeConnection(true);
     else if (action === 'begin-connect') completeConnection(false);
     else if (action === 'write') {
@@ -1197,7 +1161,7 @@ globalThis.lucide = {createIcons() {
     else if (action === 'refresh-review') { state.result = null; go('connect-progress'); if (window.BfgNative) nativeAction('refresh-read'); }
     else if (action === 'confirm-write') {
       if (state.writeType === 'dashboard' && !state.dashboardWriteSupported) return;
-      if (state.writeType === 'meter' && !state.writeSupported && !state.readOnlyVehicle) return;
+      if (state.readOnlyVehicle || (state.writeType === 'meter' && !state.writeSupported)) return;
       state.modal = 'write-confirm'; render(); save();
     }
     else if (action === 'do-write') {
@@ -1224,6 +1188,9 @@ globalThis.lucide = {createIcons() {
     // selects the home template, and every later push would then send the
     // rider home. Only a real screen name may move navigation.
     if (update.screen == null) delete update.screen;
+    if (update.modal === 'data-cleared') {
+      Object.assign(update, {vehicleSn:'', vehicles:[], connected:false, credentialAvailable:false});
+    }
     Object.assign(state, update);
     if (update.screen) { state.screen = update.screen; nativeAction('screen', update.screen); }
     // A gate arriving opens its modal; the native side clears it after the write.
