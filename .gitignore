@@ -21,3 +21,6 @@ ios/BFGCalibration.xcodeproj/
 
 # macOS
 .DS_Store
+
+# UI regression dependencies
+node_modules/
